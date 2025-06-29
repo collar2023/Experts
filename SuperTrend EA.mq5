@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| SuperTrend EA – v3.0 (三位一体架构)                              |
+//| SuperTrend EA – v3.0 (三位一体架构 + 增强风控)                    |
 //| 主框架文件                                                      |
 //+------------------------------------------------------------------+
 #property copyright "© 2025"
@@ -50,39 +50,42 @@ bool OpenMarketOrder_NoStopsThenModify(ENUM_ORDER_TYPE orderType,
       return false;
    }
 
-   // —— 合法距离计算 —— //
+   // —— 获取调整后的止损价格 —— //
    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double adjustedSL = GetAdjustedStopLossPrice(openPrice, slPrice, orderType);
+   
+   // —— 合法距离计算 —— //
    int    stopPnts  = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
    double stopLevel = stopPnts * _Point;
 
    bool needAdjust=false;
-   if(slPrice>0)
+   if(adjustedSL>0)
    {
       if(orderType==ORDER_TYPE_BUY &&
-         (slPrice>=openPrice || (openPrice-slPrice)<stopLevel))
+         (adjustedSL>=openPrice || (openPrice-adjustedSL)<stopLevel))
          needAdjust=true;
 
       if(orderType==ORDER_TYPE_SELL &&
-         (slPrice<=openPrice || (slPrice-openPrice)<stopLevel))
+         (adjustedSL<=openPrice || (adjustedSL-openPrice)<stopLevel))
          needAdjust=true;
 
       if(needAdjust)
       {
-         slPrice = (orderType==ORDER_TYPE_BUY)
-                   ? openPrice - stopLevel - 3*_Point
-                   : openPrice + stopLevel + 3*_Point;
+         adjustedSL = (orderType==ORDER_TYPE_BUY)
+                      ? openPrice - stopLevel - 3*_Point
+                      : openPrice + stopLevel + 3*_Point;
          if(g_Logger != NULL && EnableDebug)
-            g_Logger.WriteInfo(StringFormat("🔧 SL自动调整为 %.5f", slPrice));
+            g_Logger.WriteInfo(StringFormat("🔧 SL最终调整为 %.5f", adjustedSL));
       }
    }
 
    // —— 修改 SL/TP，最多3次 —— //
-   if(slPrice>0 || tpPrice>0)
+   if(adjustedSL>0 || tpPrice>0)
    {
       bool ok=false;
       for(int i=0;i<3 && !ok;i++)
       {
-         ok = trd.PositionModify(_Symbol, slPrice, tpPrice);
+         ok = trd.PositionModify(_Symbol, adjustedSL, tpPrice);
          if(!ok && g_Logger != NULL)
             g_Logger.WriteWarning("PositionModify 第"+IntegerToString(i+1)+
                                    "次失败 err="+IntegerToString(GetLastError()));
@@ -90,7 +93,7 @@ bool OpenMarketOrder_NoStopsThenModify(ENUM_ORDER_TYPE orderType,
       }
       
       // === 新增：应急止损兜底保护 === //
-      if(!ok && slPrice > 0)
+      if(!ok && adjustedSL > 0)
       {
          // 获取ATR作为应急止损距离
          int atr_handle = iATR(_Symbol, _Period, 14);
@@ -154,10 +157,11 @@ int OnInit()
       Print("日志模块初始化失败");
       return INIT_FAILED;
    }
-   g_Logger.WriteInfo("EA v3.0 启动成功 (含紧急止损保护)");
+   g_Logger.WriteInfo("EA v3.0 启动成功 (含增强风控保护)");
 
-   // 各子模块
-   InitRiskModule();
+   // 各子模块初始化
+   InitRiskModule();  // 风控模块初始化
+   
    if(!InitEntryModule(_Symbol,_Period))
    {
       g_Logger.WriteError("入场模块初始化失败");
@@ -170,7 +174,7 @@ int OnInit()
    }
    ConfigureTrader(g_trade);
 
-   g_Logger.WriteInfo("架构: SuperTrend 入场 · SAR/ADX 出场 · 风控统一 · 紧急止损保护");
+   g_Logger.WriteInfo("架构: SuperTrend入场 · SAR/ADX出场 · 增强风控 · 紧急止损保护");
    return INIT_SUCCEEDED;
 }
 
@@ -179,9 +183,11 @@ void OnDeinit(const int reason)
 {
    DeinitEntryModule();
    DeinitExitModule();
+   DeinitRiskModule();  // 清理风控模块资源
+   
    if(g_Logger != NULL)
    {
-      g_Logger.WriteInfo("EA 停止，清理日志模块");
+      g_Logger.WriteInfo("EA 停止，清理所有模块");
       CleanupLogger();
    }
 }
@@ -210,11 +216,12 @@ void OnTick()
 //======================== 开仓函数 ==================================
 void OpenPosition(ENUM_ORDER_TYPE type, double sl)
 {
+   // 使用增强风控的手数计算
    double lot = CalculateLotSize(sl, type);
    if(lot<=0)
    {
       if(EnableDebug && g_Logger != NULL)
-         g_Logger.WriteWarning("信号有效，但手数=0，跳过交易");
+         g_Logger.WriteWarning("信号有效，但风控后手数=0，跳过交易");
       return;
    }
 
@@ -224,7 +231,7 @@ void OpenPosition(ENUM_ORDER_TYPE type, double sl)
       g_initialSL = sl;
       g_step1Done = g_step2Done = false;
       if(g_Logger != NULL)
-         g_Logger.WriteInfo(StringFormat("开仓成功: %s %.2f手 SL=%.5f",
+         g_Logger.WriteInfo(StringFormat("开仓成功: %s %.2f手 原始SL=%.5f",
                                           EnumToString(type), lot, sl));
    }
    else if(g_Logger != NULL)
