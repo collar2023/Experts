@@ -2,6 +2,7 @@
 //|                                     SAR_ADX_Exit_Module.mqh       |
 //|        SAR+ADX联合出场 与 RRR分步止盈 整合出场模块             |
 //|               (新增空头出场逻辑, 成为完整版)                   |
+//|               (新增1.5R生效前提条件)                          |
 //+------------------------------------------------------------------+
 
 #property strict
@@ -17,6 +18,8 @@ input double   SAR_Step         = 0.02;     // SAR 步长
 input double   SAR_Maximum      = 0.2;      // SAR 最大值
 input int      ADX_Period       = 14;       // ADX 周期
 input double   ADX_MinLevel     = 25.0;     // ADX 最小阈值 (用于确认趋势)
+input double   SAR_MinRRatio    = 1.5;      // SAR信号生效的最小R倍数
+input int      ATR_Period       = 14;       // ATR周期 (当SL失效时使用)
 
 input group    "--- Step Take Profit Settings (RRR) ---"
 input bool     EnableStepTP     = true;     // [开关] 是否启用分步止盈
@@ -31,6 +34,7 @@ input double   Step2Factor      = 1.5;      // TP2 触发因子 (实际RRR = RRr
 
 int sar_handle_exit = INVALID_HANDLE;
 int adx_handle_exit = INVALID_HANDLE;
+int atr_handle_exit = INVALID_HANDLE;
 
 enum EXIT_REASON { NO_EXIT, EXIT_LONG, EXIT_SHORT };
 
@@ -54,7 +58,14 @@ bool InitExitModule(const string symbol, const ENUM_TIMEFRAMES period)
       return false;
    }
    
-   Print("SAR+ADX+StepTP 统一出场模块初始化成功");
+   atr_handle_exit = iATR(symbol, period, ATR_Period);
+   if(atr_handle_exit == INVALID_HANDLE) 
+   {
+      Print("出场模块: ATR指标初始化失败. Error: ", GetLastError());
+      return false;
+   }
+   
+   Print("SAR+ADX+StepTP 统一出场模块初始化成功 (含1.5R条件)");
    return true;
 }
 
@@ -62,10 +73,52 @@ void DeinitExitModule()
 {
    if(sar_handle_exit != INVALID_HANDLE) IndicatorRelease(sar_handle_exit);
    if(adx_handle_exit != INVALID_HANDLE) IndicatorRelease(adx_handle_exit);
+   if(atr_handle_exit != INVALID_HANDLE) IndicatorRelease(atr_handle_exit);
 }
 
-// 内部逻辑：获取反转信号
-EXIT_REASON GetReversalSignal()
+// 计算当前盈利的R倍数 (基于风险单位，非RRR概念)
+double CalculateCurrentRMultiple(const double openPrice, const double initialSL, ENUM_POSITION_TYPE posType)
+{
+   if(openPrice <= 0) return 0.0;
+   
+   double riskPoints = 0.0;
+   
+   // 优先使用SL计算风险单位R
+   if(initialSL > 0)
+   {
+      if(posType == POSITION_TYPE_BUY)
+         riskPoints = (openPrice - initialSL) / _Point;
+      else
+         riskPoints = (initialSL - openPrice) / _Point;
+   }
+   
+   // SL无效时使用ATR作为风险单位
+   if(riskPoints <= 0)
+   {
+      double atr[1];
+      if(CopyBuffer(atr_handle_exit, 0, 1, 1, atr) < 1) return 0.0;
+      riskPoints = atr[0] / _Point;
+   }
+   
+   if(riskPoints <= 0) return 0.0;
+   
+   // 计算当前盈利点数
+   double currentPrice = (posType == POSITION_TYPE_BUY) 
+                        ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                        : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   double profitPoints = 0.0;
+   if(posType == POSITION_TYPE_BUY)
+      profitPoints = (currentPrice - openPrice) / _Point;
+   else
+      profitPoints = (openPrice - currentPrice) / _Point;
+   
+   // 返回盈利相对于风险单位的倍数 (这是纯粹的R倍数，不是RRR)
+   return profitPoints / riskPoints;
+}
+
+// 内部逻辑：获取反转信号 (带1.5R条件检查)
+EXIT_REASON GetReversalSignal(const double openPrice, const double initialSL, ENUM_POSITION_TYPE posType)
 {
    double sar[2];
    if(CopyBuffer(sar_handle_exit, 0, 0, 2, sar) < 2) return NO_EXIT;
@@ -81,6 +134,10 @@ EXIT_REASON GetReversalSignal()
    if(!sarReversedToDown && !sarReversedToUp) return NO_EXIT;
    
    EXIT_REASON reason = sarReversedToDown ? EXIT_LONG : EXIT_SHORT;
+   
+   // 检查是否达到1.5R条件 (这里的R是风险单位，不是RRR)
+   double currentRMultiple = CalculateCurrentRMultiple(openPrice, initialSL, posType);
+   if(currentRMultiple < SAR_MinRRatio) return NO_EXIT;
 
    if(UseADXFilter)
    {
@@ -105,8 +162,8 @@ EXIT_REASON GetReversalSignal()
 // 主函数：获取多头出场指令 (返回平仓百分比)
 double GetLongExitAction(const double openPrice, const double initialSL, bool &step1Done, bool &step2Done)
 {
-   // 1. SAR反转信号触发，直接全平
-   if(UseSARReversal && GetReversalSignal() == EXIT_LONG)
+   // 1. SAR反转信号触发，直接全平 (需达到1.5R条件)
+   if(UseSARReversal && GetReversalSignal(openPrice, initialSL, POSITION_TYPE_BUY) == EXIT_LONG)
       return 100.0;
 
    // 2. 分步止盈逻辑
@@ -141,8 +198,8 @@ double GetLongExitAction(const double openPrice, const double initialSL, bool &s
 // 主函数：获取空头出场指令 (返回平仓百分比)
 double GetShortExitAction(const double openPrice, const double initialSL, bool &step1Done, bool &step2Done)
 {
-   // 1. SAR反转信号触发，直接全平
-   if(UseSARReversal && GetReversalSignal() == EXIT_SHORT)
+   // 1. SAR反转信号触发，直接全平 (需达到1.5R条件)
+   if(UseSARReversal && GetReversalSignal(openPrice, initialSL, POSITION_TYPE_SELL) == EXIT_SHORT)
       return 100.0;
 
    // 2. 分步止盈逻辑
