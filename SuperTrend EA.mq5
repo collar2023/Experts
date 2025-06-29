@@ -1,193 +1,152 @@
 //+------------------------------------------------------------------+
-//| SuperTrend EA – v3.0 (三位一体架构 + 增强风控)                    |
-//| 主框架文件                                                      |
+//| SuperTrend EA – v3.0 (三位一体架构 + 紧急止损 1.5×ATR)           |
+//| 修正版：                                                         |
+//|  • 移除非法引用语法                                             |
+//|  • 所有逻辑与 g_Logger 判断改为 “g_Logger!=NULL && …”            |
 //+------------------------------------------------------------------+
 #property copyright "© 2025"
-#property version   "3.0"
+#property version   "3.00"
 #property strict
 
 //===================== 模块引入 =====================================
 #include <Trade/Trade.mqh>
-#include "SuperTrend_LogModule.mqh"   // ← 日志模块头文件 - 移到前面
+#include "SuperTrend_LogModule.mqh"
 #include "Risk_Management_Module.mqh"
 #include "SuperTrend_Entry_Module.mqh"
 #include "SAR_ADX_Exit_Module.mqh"
 #include "Common_Defines.mqh"
 
 //===================== 全局对象 & 变量 ===============================
-CLogModule* g_Logger = NULL;      // 日志指针 - 确保声明在这里
-CTrade      g_trade;              // 交易对象
+CLogModule* g_Logger = NULL;
+CTrade      g_trade;
 
-input bool EnableDebug = true;    // 全局调试开关
+input bool   EnableDebug            = true;
+input int    EmergencyATRPeriod     = 14;
+input double EmergencyATRMultiplier = 1.5;
 
 bool   g_step1Done = false;
 bool   g_step2Done = false;
 double g_initialSL = 0.0;
 
-//===================== 裸单开仓 + 合法补 SL + 紧急止损保护 ==============
-bool OpenMarketOrder_NoStopsThenModify(ENUM_ORDER_TYPE orderType,
-                                       double lot,
-                                       double slPrice,
-                                       double tpPrice,
-                                       string comment="ST-EA")
+//===================== 工具函数 =====================================
+double MarketBid() { double v; SymbolInfoDouble(_Symbol, SYMBOL_BID,  v); return v; }
+double MarketAsk() { double v; SymbolInfoDouble(_Symbol, SYMBOL_ASK, v); return v; }
+
+//===================== 新版开仓函数 =================================
+bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType,
+                           double originalSL,
+                           double tpPrice      = 0,
+                           string comment      = "ST-EA")
 {
-   CTrade trd;
-   trd.SetTypeFillingBySymbol(_Symbol);
-   trd.SetDeviationInPoints(int(Risk_slippage));
-
-   double price = (orderType==ORDER_TYPE_BUY)
-                  ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                  : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(price<=0)
+   /* 1️⃣ 手数计算（含滑点缓冲） */
+   double lot = CalculateLotSize(originalSL, orderType);
+   if(lot <= 0.0)
    {
-      if(g_Logger != NULL) g_Logger.WriteError("价格获取失败");
+      if(g_Logger != NULL && EnableDebug)
+         g_Logger.WriteWarning("风控后手数=0，跳过交易");
       return false;
    }
 
-   if(!trd.PositionOpen(_Symbol, orderType, lot, price, 0, 0, comment))
+   /* 2️⃣ 裸单开仓（直接用全局 g_trade） */
+   double estPrice = (orderType == ORDER_TYPE_BUY) ? MarketAsk() : MarketBid();
+   g_trade.SetDeviationInPoints((int)Risk_slippage);
+
+   if(!g_trade.PositionOpen(_Symbol, orderType, lot, estPrice, 0, 0, comment))
    {
-      if(g_Logger != NULL) g_Logger.WriteError("开仓失败 err="+IntegerToString(GetLastError()));
+      if(g_Logger != NULL)
+         g_Logger.WriteError(StringFormat("开仓失败 err=%d", GetLastError()));
       return false;
    }
 
-   // —— 获取调整后的止损价格 —— //
-   double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-   double adjustedSL = GetAdjustedStopLossPrice(openPrice, slPrice, orderType);
-   
-   // —— 合法距离计算 —— //
-   int    stopPnts  = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double stopLevel = stopPnts * _Point;
-
-   bool needAdjust=false;
-   if(adjustedSL>0)
+   /* 3️⃣ 获取实际价 & 风险偏差提示 */
+   if(!PositionSelect(_Symbol))
    {
-      if(orderType==ORDER_TYPE_BUY &&
-         (adjustedSL>=openPrice || (openPrice-adjustedSL)<stopLevel))
-         needAdjust=true;
+      if(g_Logger != NULL) g_Logger.WriteError("开仓后无法选中仓位");
+      return false;
+   }
+   double openP        = PositionGetDouble(POSITION_PRICE_OPEN);
+   double estRiskPts   = MathAbs(estPrice - originalSL) / _Point;
+   double actRiskPts   = MathAbs(openP   - originalSL) / _Point;
 
-      if(orderType==ORDER_TYPE_SELL &&
-         (adjustedSL<=openPrice || (adjustedSL-openPrice)<stopLevel))
-         needAdjust=true;
+   if(MathAbs(actRiskPts - estRiskPts) > estRiskPts * 0.1 && g_Logger != NULL)
+      g_Logger.WriteWarning(StringFormat("滑点导致风险偏差: 预期 %.1f → 实际 %.1f 点",
+                                         estRiskPts, actRiskPts));
 
-      if(needAdjust)
-      {
-         adjustedSL = (orderType==ORDER_TYPE_BUY)
-                      ? openPrice - stopLevel - 3*_Point
-                      : openPrice + stopLevel + 3*_Point;
-         if(g_Logger != NULL && EnableDebug)
-            g_Logger.WriteInfo(StringFormat("🔧 SL最终调整为 %.5f", adjustedSL));
-      }
+   /* 4️⃣ 计算一次性最终 SL */
+   double finalSL = CalculateFinalStopLoss(openP, originalSL, orderType);
+
+   /* 5️⃣ 更严格应急 SL */
+   double safeSL  = GetSaferEmergencyStopLoss(openP, originalSL, orderType);
+   if(orderType == ORDER_TYPE_BUY)  finalSL = MathMax(finalSL, safeSL);
+   else                             finalSL = MathMin(finalSL, safeSL);
+
+   /* 6️⃣ 设置止损（带重试） */
+   if(!SetStopLossWithRetry(g_trade, finalSL, tpPrice, 3))
+   {
+      if(g_Logger != NULL)
+         g_Logger.WriteError("🚨 无法设置安全止损，执行保护性平仓");
+      g_trade.PositionClose(_Symbol);
+      return false;
    }
 
-   // —— 修改 SL/TP，最多3次 —— //
-   if(adjustedSL>0 || tpPrice>0)
-   {
-      bool ok=false;
-      for(int i=0;i<3 && !ok;i++)
-      {
-         ok = trd.PositionModify(_Symbol, adjustedSL, tpPrice);
-         if(!ok && g_Logger != NULL)
-            g_Logger.WriteWarning("PositionModify 第"+IntegerToString(i+1)+
-                                   "次失败 err="+IntegerToString(GetLastError()));
-         if(!ok) Sleep(200);
-      }
-      
-      // === 新增：应急止损兜底保护 === //
-      if(!ok && adjustedSL > 0)
-      {
-         // 获取ATR作为应急止损距离
-         int atr_handle = iATR(_Symbol, _Period, 14);
-         if(atr_handle != INVALID_HANDLE)
-         {
-            double atr[1];
-            if(CopyBuffer(atr_handle, 0, 1, 1, atr) > 0)
-            {
-               double emergencySL = 0;
-               
-               if(orderType == ORDER_TYPE_BUY)
-                  emergencySL = openPrice - atr[0] * 2.0;  // 2倍ATR作应急距离
-               else
-                  emergencySL = openPrice + atr[0] * 2.0;
-               
-               // 尝试设置应急SL
-               if(trd.PositionModify(_Symbol, emergencySL, tpPrice))
-               {
-                  if(g_Logger != NULL)
-                     g_Logger.WriteWarning(StringFormat("⚠️ 应急SL生效: %.5f (2xATR)", emergencySL));
-               }
-               else
-               {
-                  // 最后手段：直接平仓
-                  if(g_Logger != NULL)
-                     g_Logger.WriteError("🚨 无法设置任何SL，执行保护性平仓");
-                  trd.PositionClose(_Symbol);
-               }
-            }
-            else
-            {
-               // ATR数据获取失败，直接平仓保护
-               if(g_Logger != NULL)
-                  g_Logger.WriteError("🚨 ATR数据获取失败，执行保护性平仓");
-               trd.PositionClose(_Symbol);
-            }
-            IndicatorRelease(atr_handle);
-         }
-         else
-         {
-            // ATR句柄创建失败，直接平仓保护
-            if(g_Logger != NULL)
-               g_Logger.WriteError("🚨 ATR句柄创建失败，执行保护性平仓");
-            trd.PositionClose(_Symbol);
-         }
-      }
-      else if(!ok && g_Logger != NULL) 
-      {
-         g_Logger.WriteError("最终仍未能设置止损！");
-      }
-   }
+   if(g_Logger != NULL)
+      g_Logger.WriteInfo(StringFormat("开仓成功: %.2f 手 @ %.5f | SL=%.5f",
+                                      lot, openP, finalSL));
    return true;
 }
 
-//========================== OnInit ==================================
+//===================== 安全应急 SL 计算 =============================
+double GetSaferEmergencyStopLoss(double openP,
+                                 double originalSL,
+                                 ENUM_ORDER_TYPE orderType)
+{
+   double oriRisk = MathAbs(openP - originalSL);
+
+   int    hATR = iATR(_Symbol, _Period, EmergencyATRPeriod);
+   double atr[1];
+   double safeDist = oriRisk;
+   if(hATR != INVALID_HANDLE && CopyBuffer(hATR, 0, 0, 1, atr) > 0)
+   {
+      double atrDist = atr[0] * EmergencyATRMultiplier;
+      safeDist = MathMin(oriRisk, atrDist);
+      IndicatorRelease(hATR);
+   }
+
+   return (orderType == ORDER_TYPE_BUY)
+          ? (openP - safeDist)
+          : (openP + safeDist);
+}
+
+//=========================== OnInit =================================
 int OnInit()
 {
-   // 初始化日志
    if(!InitializeLogger(LOG_LEVEL_INFO))
-   {
-      Print("日志模块初始化失败");
-      return INIT_FAILED;
-   }
-   g_Logger.WriteInfo("EA v3.0 启动成功 (含增强风控保护)");
+   { Print("日志初始化失败"); return INIT_FAILED; }
 
-   // 各子模块初始化
-   InitRiskModule();  // 风控模块初始化
-   
-   if(!InitEntryModule(_Symbol,_Period))
-   {
-      g_Logger.WriteError("入场模块初始化失败");
-      return INIT_FAILED;
-   }
-   if(!InitExitModule(_Symbol,_Period))
-   {
-      g_Logger.WriteError("出场模块初始化失败");
-      return INIT_FAILED;
-   }
+   g_Logger.WriteInfo("EA v3.0 启动成功 (修正版)");
+
+   InitRiskModule();
+   if(!InitEntryModule(_Symbol, _Period))
+   { g_Logger.WriteError("入场模块初始化失败"); return INIT_FAILED; }
+   if(!InitExitModule(_Symbol, _Period))
+   { g_Logger.WriteError("出场模块初始化失败"); return INIT_FAILED; }
+
    ConfigureTrader(g_trade);
+   g_Logger.WriteInfo("架构: SuperTrend入场 · SAR/ADX出场 · 风控增强");
 
-   g_Logger.WriteInfo("架构: SuperTrend入场 · SAR/ADX出场 · 增强风控 · 紧急止损保护");
    return INIT_SUCCEEDED;
 }
 
-//========================== OnDeinit ================================
+//=========================== OnDeinit ===============================
 void OnDeinit(const int reason)
 {
    DeinitEntryModule();
    DeinitExitModule();
-   DeinitRiskModule();  // 清理风控模块资源
-   
+   DeinitRiskModule();
+
    if(g_Logger != NULL)
    {
-      g_Logger.WriteInfo("EA 停止，清理所有模块");
+      g_Logger.WriteInfo("EA 停止，清理模块");
       CleanupLogger();
    }
 }
@@ -195,75 +154,55 @@ void OnDeinit(const int reason)
 //=========================== OnTick =================================
 void OnTick()
 {
-   // 已有持仓 → 交给管理函数
-   if(PositionSelect(_Symbol))
-   {
-      ManagePosition();
-      return;
-   }
-   // 风控判定
-   if(!CanOpenNewTrade(EnableDebug))
-      return;
+   if(PositionSelect(_Symbol)) { ManagePosition(); return; }
 
-   // 入场信号
-   double sl_price=0;
+   if(!CanOpenNewTrade(EnableDebug)) return;
+
+   double sl_price = 0;
    ENUM_ORDER_TYPE sig = GetEntrySignal(sl_price);
-   if(sig==ORDER_TYPE_NONE) return;
+   if(sig == ORDER_TYPE_NONE) return;
 
    OpenPosition(sig, sl_price);
 }
 
-//======================== 开仓函数 ==================================
+//=========================== 开仓接口 ================================
 void OpenPosition(ENUM_ORDER_TYPE type, double sl)
 {
-   // 使用增强风控的手数计算
-   double lot = CalculateLotSize(sl, type);
-   if(lot<=0)
-   {
-      if(EnableDebug && g_Logger != NULL)
-         g_Logger.WriteWarning("信号有效，但风控后手数=0，跳过交易");
-      return;
-   }
-
-   bool ok = OpenMarketOrder_NoStopsThenModify(type, lot, sl, 0, "ST-EA");
+   bool ok = OpenMarketOrder_Fixed(type, sl, 0, "ST-EA");
    if(ok)
    {
       g_initialSL = sl;
       g_step1Done = g_step2Done = false;
-      if(g_Logger != NULL)
-         g_Logger.WriteInfo(StringFormat("开仓成功: %s %.2f手 原始SL=%.5f",
-                                          EnumToString(type), lot, sl));
    }
-   else if(g_Logger != NULL)
-      g_Logger.WriteError("开仓总体失败，见前面日志");
 }
 
-//====================== 持仓管理 ====================================
+//======================== 持仓管理函数 ===============================
 void ManagePosition()
 {
-   double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-   double volume    = PositionGetDouble(POSITION_VOLUME);
-   ENUM_POSITION_TYPE pType=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double openP = PositionGetDouble(POSITION_PRICE_OPEN);
+   double vol   = PositionGetDouble(POSITION_VOLUME);
+   ENUM_POSITION_TYPE pType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
-   double pctToClose = (pType==POSITION_TYPE_BUY)
-                      ? GetLongExitAction(openPrice,g_initialSL,g_step1Done,g_step2Done)
-                      : GetShortExitAction(openPrice,g_initialSL,g_step1Done,g_step2Done);
-   if(pctToClose<=0.0) return;
+   double pct = (pType == POSITION_TYPE_BUY)
+              ? GetLongExitAction(openP, g_initialSL, g_step1Done, g_step2Done)
+              : GetShortExitAction(openP, g_initialSL, g_step1Done, g_step2Done);
+   if(pct <= 0.0) return;
 
-   // 全平
-   if(pctToClose>=100.0)
+   if(pct >= 100.0)
    {
       if(g_trade.PositionClose(_Symbol) && g_Logger != NULL)
          g_Logger.WriteInfo("全仓平仓成功");
       return;
    }
 
-   // 部分平
-   double volClose = volume * pctToClose/100.0;
-   volClose = MathMax(volClose, SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN));
-   double step = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
-   volClose = MathFloor(volClose/step)*step;
+   double volClose = vol * pct / 100.0;
+   volClose = MathMax(volClose, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   volClose = MathFloor(volClose / step) * step;
 
-   if(volClose>0 && g_trade.PositionClosePartial(_Symbol,volClose) && g_Logger != NULL)
-      g_Logger.WriteInfo(StringFormat("部分止盈 %.2f%% 成功", pctToClose));
+   if(volClose > 0 &&
+      g_trade.PositionClosePartial(_Symbol, volClose) &&
+      g_Logger != NULL)
+      g_Logger.WriteInfo(StringFormat("部分止盈 %.1f%% 成功", pct));
 }
+//+------------------------------------------------------------------+
