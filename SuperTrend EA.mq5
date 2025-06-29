@@ -24,7 +24,7 @@ bool   g_step1Done = false;
 bool   g_step2Done = false;
 double g_initialSL = 0.0;
 
-//===================== 裸单开仓 + 合法补 SL ==========================
+//===================== 裸单开仓 + 合法补 SL + 紧急止损保护 ==============
 bool OpenMarketOrder_NoStopsThenModify(ENUM_ORDER_TYPE orderType,
                                        double lot,
                                        double slPrice,
@@ -88,7 +88,59 @@ bool OpenMarketOrder_NoStopsThenModify(ENUM_ORDER_TYPE orderType,
                                    "次失败 err="+IntegerToString(GetLastError()));
          if(!ok) Sleep(200);
       }
-      if(!ok && g_Logger != NULL) g_Logger.WriteError("最终仍未能设置止损！");
+      
+      // === 新增：应急止损兜底保护 === //
+      if(!ok && slPrice > 0)
+      {
+         // 获取ATR作为应急止损距离
+         int atr_handle = iATR(_Symbol, _Period, 14);
+         if(atr_handle != INVALID_HANDLE)
+         {
+            double atr[1];
+            if(CopyBuffer(atr_handle, 0, 1, 1, atr) > 0)
+            {
+               double emergencySL = 0;
+               
+               if(orderType == ORDER_TYPE_BUY)
+                  emergencySL = openPrice - atr[0] * 2.0;  // 2倍ATR作应急距离
+               else
+                  emergencySL = openPrice + atr[0] * 2.0;
+               
+               // 尝试设置应急SL
+               if(trd.PositionModify(_Symbol, emergencySL, tpPrice))
+               {
+                  if(g_Logger != NULL)
+                     g_Logger.WriteWarning(StringFormat("⚠️ 应急SL生效: %.5f (2xATR)", emergencySL));
+               }
+               else
+               {
+                  // 最后手段：直接平仓
+                  if(g_Logger != NULL)
+                     g_Logger.WriteError("🚨 无法设置任何SL，执行保护性平仓");
+                  trd.PositionClose(_Symbol);
+               }
+            }
+            else
+            {
+               // ATR数据获取失败，直接平仓保护
+               if(g_Logger != NULL)
+                  g_Logger.WriteError("🚨 ATR数据获取失败，执行保护性平仓");
+               trd.PositionClose(_Symbol);
+            }
+            IndicatorRelease(atr_handle);
+         }
+         else
+         {
+            // ATR句柄创建失败，直接平仓保护
+            if(g_Logger != NULL)
+               g_Logger.WriteError("🚨 ATR句柄创建失败，执行保护性平仓");
+            trd.PositionClose(_Symbol);
+         }
+      }
+      else if(!ok && g_Logger != NULL) 
+      {
+         g_Logger.WriteError("最终仍未能设置止损！");
+      }
    }
    return true;
 }
@@ -102,7 +154,7 @@ int OnInit()
       Print("日志模块初始化失败");
       return INIT_FAILED;
    }
-   g_Logger.WriteInfo("EA v3.0 启动成功");
+   g_Logger.WriteInfo("EA v3.0 启动成功 (含紧急止损保护)");
 
    // 各子模块
    InitRiskModule();
@@ -118,7 +170,7 @@ int OnInit()
    }
    ConfigureTrader(g_trade);
 
-   g_Logger.WriteInfo("架构: SuperTrend 入场 · SAR/ADX 出场 · 风控统一");
+   g_Logger.WriteInfo("架构: SuperTrend 入场 · SAR/ADX 出场 · 风控统一 · 紧急止损保护");
    return INIT_SUCCEEDED;
 }
 

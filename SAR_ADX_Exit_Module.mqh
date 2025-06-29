@@ -1,8 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                     SAR_ADX_Exit_Module.mqh       |
 //|        SAR+ADX联合出场 与 RRR分步止盈 整合出场模块             |
-//|               (新增空头出场逻辑, 成为完整版)                   |
-//|               (新增1.5R生效前提条件)                          |
+//|          (修复版: 适配紧急止损保护机制)                        |
 //+------------------------------------------------------------------+
 
 #property strict
@@ -27,6 +26,9 @@ input double   RRratio          = 2.0;      // 基础风险回报比 (用于TP1)
 input double   Step1Pct         = 40.0;     // TP1 平仓百分比
 input double   Step2Pct         = 30.0;     // TP2 平仓百分比
 input double   Step2Factor      = 1.5;      // TP2 触发因子 (实际RRR = RRratio * Step2Factor)
+
+input group    "--- Emergency SL Adaptation ---"
+// 注意：紧急止损是安全保护机制，与交易逻辑的R倍数计算分离
 
 //==================================================================
 //  全局变量与枚举
@@ -65,7 +67,7 @@ bool InitExitModule(const string symbol, const ENUM_TIMEFRAMES period)
       return false;
    }
    
-   Print("SAR+ADX+StepTP 统一出场模块初始化成功 (含1.5R条件)");
+   Print("SAR+ADX+StepTP 统一出场模块初始化成功 (适配紧急止损保护)");
    return true;
 }
 
@@ -76,30 +78,39 @@ void DeinitExitModule()
    if(atr_handle_exit != INVALID_HANDLE) IndicatorRelease(atr_handle_exit);
 }
 
-// 计算当前盈利的R倍数 (基于风险单位，非RRR概念)
-double CalculateCurrentRMultiple(const double openPrice, const double initialSL, ENUM_POSITION_TYPE posType)
+// 计算交易逻辑的R倍数风险单位 (与止损保护系统分离)
+double CalculateRiskUnit(const double openPrice, const double originalSL, ENUM_POSITION_TYPE posType)
 {
-   if(openPrice <= 0) return 0.0;
-   
    double riskPoints = 0.0;
    
-   // 优先使用SL计算风险单位R
-   if(initialSL > 0)
+   // 只使用原始交易计划的SL计算R倍数
+   if(originalSL > 0)
    {
       if(posType == POSITION_TYPE_BUY)
-         riskPoints = (openPrice - initialSL) / _Point;
+         riskPoints = (openPrice - originalSL) / _Point;
       else
-         riskPoints = (initialSL - openPrice) / _Point;
+         riskPoints = (originalSL - openPrice) / _Point;
    }
    
-   // SL无效时使用ATR作为风险单位
+   // 如果原始SL无效，使用ATR作为默认风险单位 (但这与紧急止损无关)
    if(riskPoints <= 0)
    {
       double atr[1];
-      if(CopyBuffer(atr_handle_exit, 0, 1, 1, atr) < 1) return 0.0;
-      riskPoints = atr[0] / _Point;
+      if(CopyBuffer(atr_handle_exit, 0, 1, 1, atr) >= 1)
+      {
+         riskPoints = atr[0] / _Point;  // 标准1倍ATR，不是紧急止损的2倍
+      }
    }
    
+   return riskPoints;
+}
+
+// 计算当前盈利的R倍数 (修复版)
+double CalculateCurrentRMultiple(const double openPrice, const double originalSL, ENUM_POSITION_TYPE posType)
+{
+   if(openPrice <= 0) return 0.0;
+   
+   double riskPoints = CalculateRiskUnit(openPrice, originalSL, posType);
    if(riskPoints <= 0) return 0.0;
    
    // 计算当前盈利点数
@@ -113,12 +124,32 @@ double CalculateCurrentRMultiple(const double openPrice, const double initialSL,
    else
       profitPoints = (openPrice - currentPrice) / _Point;
    
-   // 返回盈利相对于风险单位的倍数 (这是纯粹的R倍数，不是RRR)
    return profitPoints / riskPoints;
 }
 
-// 内部逻辑：获取反转信号 (带1.5R条件检查)
-EXIT_REASON GetReversalSignal(const double openPrice, const double initialSL, ENUM_POSITION_TYPE posType)
+// 判断是否为紧急止损 (通过比较当前SL与原始SL)
+// 注意：这个函数现在仅用于日志记录，不影响交易逻辑
+bool IsEmergencyStopLoss(const double originalSL)
+{
+   if(originalSL <= 0) return true;  // 原始SL无效，必定是紧急SL
+   
+   double currentSL = PositionGetDouble(POSITION_SL);
+   if(currentSL <= 0) return false;  // 当前无SL
+   
+   // 比较差异：如果当前SL与原始SL差异超过阈值，认为是紧急SL
+   double slDiff = MathAbs(currentSL - originalSL);
+   double atr[1];
+   if(CopyBuffer(atr_handle_exit, 0, 1, 1, atr) >= 1)
+   {
+      double atrThreshold = atr[0] * 0.5;  // 0.5ATR作为判断阈值
+      return slDiff > atrThreshold;
+   }
+   
+   return false;
+}
+
+// 内部逻辑：获取反转信号 (适配紧急止损)
+EXIT_REASON GetReversalSignal(const double openPrice, const double originalSL, ENUM_POSITION_TYPE posType)
 {
    double sar[2];
    if(CopyBuffer(sar_handle_exit, 0, 0, 2, sar) < 2) return NO_EXIT;
@@ -135,8 +166,8 @@ EXIT_REASON GetReversalSignal(const double openPrice, const double initialSL, EN
    
    EXIT_REASON reason = sarReversedToDown ? EXIT_LONG : EXIT_SHORT;
    
-   // 检查是否达到1.5R条件 (这里的R是风险单位，不是RRR)
-   double currentRMultiple = CalculateCurrentRMultiple(openPrice, initialSL, posType);
+// 检查R倍数条件 (基于原始交易逻辑，与紧急止损无关)
+   double currentRMultiple = CalculateCurrentRMultiple(openPrice, originalSL, posType);
    if(currentRMultiple < SAR_MinRRatio) return NO_EXIT;
 
    if(UseADXFilter)
@@ -159,20 +190,20 @@ EXIT_REASON GetReversalSignal(const double openPrice, const double initialSL, EN
    return reason;
 }
 
-// 主函数：获取多头出场指令 (返回平仓百分比)
-double GetLongExitAction(const double openPrice, const double initialSL, bool &step1Done, bool &step2Done)
+// 主函数：获取多头出场指令 (修复版)
+double GetLongExitAction(const double openPrice, const double originalSL, bool &step1Done, bool &step2Done)
 {
-   // 1. SAR反转信号触发，直接全平 (需达到1.5R条件)
-   if(UseSARReversal && GetReversalSignal(openPrice, initialSL, POSITION_TYPE_BUY) == EXIT_LONG)
+   // 1. SAR反转信号触发，直接全平
+   if(UseSARReversal && GetReversalSignal(openPrice, originalSL, POSITION_TYPE_BUY) == EXIT_LONG)
       return 100.0;
 
-   // 2. 分步止盈逻辑
+   // 2. 分步止盈逻辑 (使用智能风险单位计算)
    if(EnableStepTP)
    {
-      if(openPrice <= 0 || initialSL <= 0 || RRratio <= 0)
+      if(openPrice <= 0 || RRratio <= 0)
          return 0.0;
 
-      double riskPts = (openPrice - initialSL) / _Point;
+      double riskPts = CalculateRiskUnit(openPrice, originalSL, POSITION_TYPE_BUY);
       if(riskPts <= 0)
          return 0.0;
 
@@ -195,20 +226,20 @@ double GetLongExitAction(const double openPrice, const double initialSL, bool &s
    return 0.0;
 }
 
-// 主函数：获取空头出场指令 (返回平仓百分比)
-double GetShortExitAction(const double openPrice, const double initialSL, bool &step1Done, bool &step2Done)
+// 主函数：获取空头出场指令 (修复版)
+double GetShortExitAction(const double openPrice, const double originalSL, bool &step1Done, bool &step2Done)
 {
-   // 1. SAR反转信号触发，直接全平 (需达到1.5R条件)
-   if(UseSARReversal && GetReversalSignal(openPrice, initialSL, POSITION_TYPE_SELL) == EXIT_SHORT)
+   // 1. SAR反转信号触发，直接全平
+   if(UseSARReversal && GetReversalSignal(openPrice, originalSL, POSITION_TYPE_SELL) == EXIT_SHORT)
       return 100.0;
 
-   // 2. 分步止盈逻辑
+   // 2. 分步止盈逻辑 (使用智能风险单位计算)
    if(EnableStepTP)
    {
-      if(openPrice <= 0 || initialSL <= 0 || RRratio <= 0)
+      if(openPrice <= 0 || RRratio <= 0)
          return 0.0;
 
-      double riskPts = (initialSL - openPrice) / _Point;
+      double riskPts = CalculateRiskUnit(openPrice, originalSL, POSITION_TYPE_SELL);
       if(riskPts <= 0)
          return 0.0;
 
