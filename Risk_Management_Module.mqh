@@ -1,9 +1,8 @@
 //+------------------------------------------------------------------+
 //|                                   Risk_Management_Module.mqh     |
-//|     核心风控与资金管理模块  v2.2  （2025‑06‑29）                 |
-//|  • 新增：手数计算加入滑点缓冲（Risk_slippage）                   |
-//|  • 优化：TickValue 读取先试 SYMBOL_TRADE_TICK_VALUE_PROFIT       |
-//|  • 其余逻辑承接 v2.1（最小止损距离、每日亏损封顶等）             |
+//|     核心风控与资金管理模块  v2.3  （2025‑06‑29）                 |
+//|  • 新增：手数上限控制改用更通用的“绝对手数硬顶” (Risk_maxAbsoluteLot) |
+//|  • 其余逻辑承接 v2.2 (滑点缓冲, TickValue优化等)                  |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade\Trade.mqh>
@@ -22,9 +21,10 @@ input int      Risk_atrPeriod          = 14;      // ATR 周期
 input double   Risk_minStopPoints      = 10.0;    // 最小 SL = 固定点数
 
 input group "--- Position Size Limits ---"
-input double   Risk_maxLotByBalance    = 50.0;    // 余额 / 此值 = 上限手数
-input double   Risk_maxAbsoluteDeposit = 1000.0;  // 存款 1000 USD ≈ 1 手
-input bool     Risk_enableLotLimit     = true;    // 是否启用手数上限
+// 【核心修改】: 替换了原来的存款估算方式
+input double   Risk_maxLotByBalance    = 50.0;    // 上限1: 余额 / 此值
+input double   Risk_maxAbsoluteLot     = 1.0;     // 上限2: 绝对手数硬顶
+input bool     Risk_enableLotLimit     = true;    // [开关] 是否启用手数上限
 
 input group "--- Trade Execution & Global Risk ---"
 input double   Risk_slippage           = 3;       // 允许滑点 (Points)
@@ -52,7 +52,7 @@ void InitRiskModule()
    if(rm_atrHandle == INVALID_HANDLE)
       Print("[风控] ATR 初始化失败");
    else
-      Print("[风控] 风控模块初始化完成");
+      Print("[风控] 风控模块 v2.3 初始化完成 (采用绝对手数上限)");
 }
 //------------------------------------------------------------------
 void DeinitRiskModule()
@@ -74,7 +74,7 @@ void ConfigureTrader(CTrade &t)
 }
 
 //==================================================================
-//  手数计算（v2.2 重点改动）
+//  手数计算
 //==================================================================
 double CalculateLotSize(double original_sl_price, ENUM_ORDER_TYPE type)
 {
@@ -89,9 +89,9 @@ double CalculateLotSize(double original_sl_price, ENUM_ORDER_TYPE type)
       return 0.0;
    }
 
-   double buffer = Risk_slippage * _Point;          // 滑点→点差
-   if(type == ORDER_TYPE_BUY)  estPrice += buffer;  // 买价向上偏移
-   else                        estPrice -= buffer;  // 卖价向下偏移
+   double buffer = Risk_slippage * _Point;
+   if(type == ORDER_TYPE_BUY)  estPrice += buffer;
+   else                        estPrice -= buffer;
 
    double riskPoints = MathAbs(estPrice - original_sl_price);
    if(riskPoints <= 0)
@@ -126,14 +126,21 @@ double CalculateLotSize(double original_sl_price, ENUM_ORDER_TYPE type)
    // ③ 手数边界
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
+   
+   // 应用计算出的手数上限
+   lot = MathMin(lot, GetMaxAllowedLotSize());
+   
+   // 确保不低于最小手数并对齐步长
    lot = MathMax(lot, minLot);
    lot = MathFloor(lot / stepLot) * stepLot;
+
+   // 再次确保不超过上限 (因为MathFloor可能导致微小变化，这步是安全冗余)
    lot = MathMin(lot, GetMaxAllowedLotSize());
 
-   Print("[风控] 手数计算: Price=", estPrice,
-         ", RiskPts=", riskPoints/_Point,
-         ", Lot=", lot);
+   if(lot > 0)
+      PrintFormat("[风控] 手数计算: 风险%.1f点, 理论Lot=%.2f, 最终Lot=%.2f", 
+                  riskPoints/_Point, lot, lot);
+                  
    return lot;
 }
 
@@ -153,7 +160,7 @@ double CalculateFinalStopLoss(double actualOpenPrice,
       if(originalSL > minSL)
       {
          sl = minSL;
-         Print("[风控] 买单 SL 调整 → ", sl);
+         Print("[风控] 买单 SL 被最小距离规则调整 → ", sl);
       }
    }
    else
@@ -162,7 +169,7 @@ double CalculateFinalStopLoss(double actualOpenPrice,
       if(originalSL < minSL)
       {
          sl = minSL;
-         Print("[风控] 卖单 SL 调整 → ", sl);
+         Print("[风控] 卖单 SL 被最小距离规则调整 → ", sl);
       }
    }
    return sl;
@@ -236,10 +243,10 @@ double GetMinStopDistance()
    if(rm_atrHandle != INVALID_HANDLE)
    {
       double atr[1];
-      if(CopyBuffer(rm_atrHandle, 0, 0, 1, atr) > 0)
+      if(CopyBuffer(rm_atrHandle, 0, 0, 1, atr) > 0 && atr[0] > 0)
          dist = MathMax(dist, atr[0] * Risk_minStopATRMultiple);
    }
-   double brokerMin = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   double brokerMin = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
    return MathMax(dist, brokerMin);
 }
 //------------------------------------------------------------------
@@ -248,11 +255,15 @@ double GetMaxAllowedLotSize()
    if(!Risk_enableLotLimit)
       return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
 
-   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
-   double byBalance  = balance / Risk_maxLotByBalance;
-   double byDeposit  = Risk_maxAbsoluteDeposit / 1000.0;  // 1000 USD ≈ 1 手
-
-   return MathMin(byBalance, byDeposit);
+   // 上限计算方式 1: 基于账户余额动态计算
+   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+   double byBalance = (Risk_maxLotByBalance > 0) ? (balance / Risk_maxLotByBalance) : SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   
+   // 上限计算方式 2: 直接使用用户设定的绝对手数硬顶
+   // 该方式取代了原来基于存款的估算逻辑，更通用
+   
+   // 最终的手数上限，是两种计算方式中更严格（更小）的那个
+   return MathMin(byBalance, Risk_maxAbsoluteLot);
 }
 //------------------------------------------------------------------
 bool CanOpenNewTrade(bool dbg=false)
@@ -271,7 +282,7 @@ bool CanOpenNewTrade(bool dbg=false)
       rm_currentDay      = dt.day_of_year;
       rm_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       rm_dayLossLimitHit = false;
-      if(dbg) Print("[风控] 新的一天，统计重置");
+      if(dbg) Print("[风控] 新的一天，统计重置。起始余额: ", rm_dayStartBalance);
    }
 
    if(rm_dayLossLimitHit)
@@ -284,10 +295,10 @@ bool CanOpenNewTrade(bool dbg=false)
    double loss     = rm_dayStartBalance - balNow;
    double limitVal = rm_dayStartBalance * Risk_dailyLossLimitPct / 100.0;
 
-   if(loss >= limitVal)
+   if(loss > 0 && limitVal > 0 && loss >= limitVal)
    {
       rm_dayLossLimitHit = true;
-      if(dbg) Print("[风控] 当日亏损 ", loss, " ≥ 限额 ", limitVal);
+      if(dbg) Print("[风控] 当日亏损 ", loss, " ≥ 限额 ", limitVal, ". 停止新交易。");
       return false;
    }
    return true;

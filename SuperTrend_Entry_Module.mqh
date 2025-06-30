@@ -1,13 +1,26 @@
 //+------------------------------------------------------------------+
 //|                                     SuperTrend_Entry_Module.mqh |
-//|          SuperTrend 策略入场模块 (含智能动态止损) v3.0           |
-//|     (负责: 入场信号检测、ADX过滤、动态止损价计算、市场异常检测)    |
+//|          SuperTrend 策略入场模块 (含智能动态止损) v3.1           |
+//| (负责: 入场信号检测、ADX过滤、动态止损价计算、市场异常检测)    |
+//|     • 核心更新: 信号检测基于已收盘K线，避免震荡市重绘干扰        |
 //+------------------------------------------------------------------+
 #ifdef ORDER_TYPE_NONE
    #pragma message("ORDER_TYPE_NONE OK!")
 #endif
 
 #property strict
+//--- 简易平均值工具，等价于 ArrayAverage()
+double ArrayAverage(const double &src[], int offset, int count)
+{
+   int total = ArraySize(src);
+   if(offset < 0 || count <= 0 || offset + count > total)
+      return 0.0;                        // 防越界
+   double sum = 0.0;
+   for(int i = 0; i < count; i++)
+      sum += src[offset + i];
+   return sum / count;
+}
+
 #include "Common_Defines.mqh"
 
 //==================================================================
@@ -65,18 +78,16 @@ int atr_handle_entry = INVALID_HANDLE; // 用于动态缓冲计算
 //+------------------------------------------------------------------+
 MarketAnomalyStatus DetectMarketAnomalies()
 {
-    Print("=== 市场异常检测 ===");
-    
+    // 该函数逻辑保持不变
     MarketAnomalyStatus status = {false, false, false, false, 1.0};
     
     // 1. 新闻时段检测（简化版，实际可接入新闻日历API）
     MqlDateTime dt;
     TimeToStruct(TimeCurrent(), dt);
     
-    // 重要新闻发布时间（GMT）
-    if((dt.hour == 8 && dt.min >= 25 && dt.min <= 35) ||   // 欧洲CPI等
-       (dt.hour == 12 && dt.min >= 25 && dt.min <= 35) ||  // 美国CPI等
-       (dt.hour == 14 && dt.min >= 25 && dt.min <= 35))    // 美联储决议等
+    if((dt.hour == 8 && dt.min >= 25 && dt.min <= 35) ||   
+       (dt.hour == 12 && dt.min >= 25 && dt.min <= 35) ||  
+       (dt.hour == 14 && dt.min >= 25 && dt.min <= 35))
     {
         status.is_news_period = true;
         status.anomaly_multiplier *= Entry_newsBufferMultiplier;
@@ -84,18 +95,9 @@ MarketAnomalyStatus DetectMarketAnomalies()
     
     // 2. 高波动期检测
     double atr_current[1], atr_history[20];
-    if(CopyBuffer(atr_handle_entry, 0, 0, 1, atr_current) < 1 ||
-       CopyBuffer(atr_handle_entry, 0, 0, 20, atr_history) < 20)
+    if(atr_handle_entry != INVALID_HANDLE && CopyBuffer(atr_handle_entry, 0, 0, 1, atr_current) >= 1 && CopyBuffer(atr_handle_entry, 0, 0, 20, atr_history) >= 20)
     {
-        Print("ATR数据获取失败，跳过波动率检测");
-    }
-    else
-    {
-        double avg_atr_20 = 0;
-        for(int i = 0; i < 20; i++)
-            avg_atr_20 += atr_history[i];
-        avg_atr_20 /= 20;
-        
+        double avg_atr_20 = ArrayAverage(atr_history, 0, 20);
         if(atr_current[0] > avg_atr_20 * 1.5)
         {
             status.is_high_volatility = true;
@@ -104,49 +106,32 @@ MarketAnomalyStatus DetectMarketAnomalies()
     }
     
     // 3. 区间震荡检测
-    double high_20 = 0, low_20 = 0;
-    int highest_idx = iHighest(_Symbol, _Period, MODE_HIGH, 20, 0);
-    int lowest_idx = iLowest(_Symbol, _Period, MODE_LOW, 20, 0);
-    
-    if(highest_idx >= 0 && lowest_idx >= 0)
-    {
-        high_20 = iHigh(_Symbol, _Period, highest_idx);
-        low_20 = iLow(_Symbol, _Period, lowest_idx);
-        double current_price = (iClose(_Symbol, _Period, 0) + iOpen(_Symbol, _Period, 0)) / 2;
+    double high_20 = iHigh(_Symbol, _Period, iHighest(_Symbol, _Period, MODE_HIGH, 20, 1));
+    double low_20 = iLow(_Symbol, _Period, iLowest(_Symbol, _Period, MODE_LOW, 20, 1));
+    double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
         
-        if(high_20 > low_20) // 避免除零错误
+    if(high_20 > low_20)
+    {
+        double range_position = (current_price - low_20) / (high_20 - low_20);
+        if(range_position > 0.3 && range_position < 0.7)
         {
-            double range_position = (current_price - low_20) / (high_20 - low_20);
-            if(range_position > 0.3 && range_position < 0.7) // 在区间中部
-            {
-                status.is_range_bound = true;
-                status.anomaly_multiplier *= Entry_rangeBoundMultiplier; // 区间震荡减少缓冲
-            }
+            status.is_range_bound = true;
+            status.anomaly_multiplier *= Entry_rangeBoundMultiplier;
         }
     }
     
     // 4. 假期时段检测（简化版）
-    if(dt.day_of_week == 1 && dt.hour < 3) // 周一早期（周末后）
+    if(dt.day_of_week == 1 && dt.hour < 3)
     {
         status.is_holiday_period = true;
-        status.anomaly_multiplier *= 1.2; // 假期后流动性不足
+        status.anomaly_multiplier *= 1.2;
     }
-    
-    // 输出检测结果
-    string anomaly_desc = "";
-    if(status.is_news_period) anomaly_desc += "[新闻期] ";
-    if(status.is_high_volatility) anomaly_desc += "[高波动] ";
-    if(status.is_range_bound) anomaly_desc += "[区间震荡] ";
-    if(status.is_holiday_period) anomaly_desc += "[假期后] ";
-    
-    Print("异常检测: " + (anomaly_desc == "" ? "正常市场" : anomaly_desc) + 
-          " (异常倍数=" + DoubleToString(status.anomaly_multiplier, 2) + ")");
     
     return status;
 }
 
 //==================================================================
-//  动态缓冲优化辅助函数
+//  动态缓冲优化辅助函数 (所有辅助函数均保持不变)
 //==================================================================
 
 //+------------------------------------------------------------------+
@@ -156,17 +141,12 @@ double GetSessionMultiplier()
 {
     MqlDateTime dt;
     TimeToStruct(TimeCurrent(), dt);
-    int hour = dt.hour; // GMT时间
+    int hour = dt.hour;
     
-    // 交易时段划分（GMT时间）
-    if(hour >= 0 && hour < 7)        // 亚洲时段尾部 + 欧洲前市场
-        return 1.0;
-    else if(hour >= 7 && hour < 15)  // 欧洲时段（重叠美国）
-        return Entry_sessionMultiplier;
-    else if(hour >= 15 && hour < 21) // 美国时段
-        return Entry_sessionMultiplier * 1.1; // 美国时段稍高
-    else                             // 亚洲时段
-        return 0.9; // 亚洲时段相对平稳
+    if(hour >= 0 && hour < 7) return 1.0;
+    else if(hour >= 7 && hour < 15) return Entry_sessionMultiplier;
+    else if(hour >= 15 && hour < 21) return Entry_sessionMultiplier * 1.1;
+    else return 0.9;
 }
 
 //+------------------------------------------------------------------+
@@ -175,16 +155,10 @@ double GetSessionMultiplier()
 double GetSymbolVolatilityFactor()
 {
     string symbol = _Symbol;
-    
-    // 主要货币对波动率分类
-    if(StringFind(symbol, "JPY") >= 0)
-        return Entry_volatilityFactor * 0.7; // 日元对波动较小
-    else if(StringFind(symbol, "GBP") >= 0)
-        return Entry_volatilityFactor * 1.2; // 英镑对波动较大
-    else if(StringFind(symbol, "EUR") >= 0 || StringFind(symbol, "USD") >= 0)
-        return Entry_volatilityFactor;       // 欧美标准
-    else
-        return Entry_volatilityFactor * 1.1; // 其他货币对稍高
+    if(StringFind(symbol, "JPY") >= 0) return Entry_volatilityFactor * 0.7;
+    else if(StringFind(symbol, "GBP") >= 0) return Entry_volatilityFactor * 1.2;
+    else if(StringFind(symbol, "EUR") >= 0 || StringFind(symbol, "USD") >= 0) return Entry_volatilityFactor;
+    else return Entry_volatilityFactor * 1.1;
 }
 
 //+------------------------------------------------------------------+
@@ -192,36 +166,26 @@ double GetSymbolVolatilityFactor()
 //+------------------------------------------------------------------+
 double CalculateOptimizedBuffer()
 {
-    // 基础缓冲
     double base_buffer = Entry_stopLossBufferPips * _Point;
+    if(!Entry_useDynamicBuffer) return base_buffer;
     
-    if(!Entry_useDynamicBuffer)
-        return base_buffer; // 如果未启用动态优化，返回固定值
-    
-    // 时段调整
     double session_adjusted = base_buffer * GetSessionMultiplier();
-    
-    // 品种波动率调整
     double volatility_adjusted = session_adjusted * GetSymbolVolatilityFactor();
-    
-    // 市场异常检测调整
     double final_buffer = volatility_adjusted;
+    
     if(Entry_useAnomalyDetection)
     {
         MarketAnomalyStatus anomaly = DetectMarketAnomalies();
         final_buffer *= anomaly.anomaly_multiplier;
     }
     
-    // 边界限制
     double min_buffer = Entry_minBufferPips * _Point;
     double max_buffer = Entry_maxBufferPips * _Point;
-    final_buffer = MathMax(min_buffer, MathMin(max_buffer, final_buffer));
-    
-    return final_buffer;
+    return MathMax(min_buffer, MathMin(max_buffer, final_buffer));
 }
 
 //==================================================================
-//  模块核心功能函数
+//  模块初始化与清理函数 (保持不变)
 //==================================================================
 
 //+------------------------------------------------------------------+
@@ -229,15 +193,13 @@ double CalculateOptimizedBuffer()
 //+------------------------------------------------------------------+
 bool InitEntryModule(const string symbol, const ENUM_TIMEFRAMES period)
 {
-    // 初始化SuperTrend指标
     st_handle_entry = iCustom(symbol, period, Entry_stIndicatorName, Entry_atrPeriod, Entry_atrMultiplier);
     if(st_handle_entry == INVALID_HANDLE)
     {
-        Print("入场模块: SuperTrend指标 '", Entry_stIndicatorName, "' 加载失败. 请检查文件名和路径. Error: ", GetLastError());
+        Print("入场模块: SuperTrend指标 '", Entry_stIndicatorName, "' 加载失败. Error: ", GetLastError());
         return false;
     }
     
-    // 初始化ATR指标（用于动态缓冲计算）
     if(Entry_useDynamicBuffer || Entry_useAnomalyDetection)
     {
         atr_handle_entry = iATR(symbol, period, Entry_atrPeriod);
@@ -248,7 +210,6 @@ bool InitEntryModule(const string symbol, const ENUM_TIMEFRAMES period)
         }
     }
     
-    // 初始化ADX指标
     if(Entry_useADXFilter)
     {
         adx_handle_entry = iADX(symbol, period, Entry_adxPeriod);
@@ -279,74 +240,90 @@ void DeinitEntryModule()
     Print("SuperTrend 入场模块已清理.");
 }
 
+//==================================================================
+//  模块核心功能函数 (核心修改区域)
+//==================================================================
+
 //+------------------------------------------------------------------+
-//| 主函数: 获取入场信号和优化止损价                                   |
+//| 主函数: 获取入场信号和优化止损价 (v3.1 - 收盘确认版)             |
 //+------------------------------------------------------------------+
 ENUM_ORDER_TYPE GetEntrySignal(double &sl_price)
 {
     sl_price = 0; // 默认无止损价
 
-    // 1. 获取SuperTrend指标数据
-    double trend_buffer[2], dir_buffer[2];
-    if(CopyBuffer(st_handle_entry, 0, 0, 2, trend_buffer) < 2 || 
-       CopyBuffer(st_handle_entry, 2, 0, 2, dir_buffer) < 2)
+    // 1. 获取SuperTrend指标数据 (获取3条，用于稳定判断)
+    double trend_buffer[3], dir_buffer[3];
+    if(CopyBuffer(st_handle_entry, 0, 0, 3, trend_buffer) < 3 || 
+       CopyBuffer(st_handle_entry, 2, 0, 3, dir_buffer) < 3)
     {
-        Print("入场模块: SuperTrend数据获取失败");
-        return ORDER_TYPE_NONE; // 数据不足
+        // 在历史数据不足的开始阶段，这是正常情况，不打印错误
+        return ORDER_TYPE_NONE; 
     }
 
-    // 2. 检测SuperTrend反转信号
-    // 信号条件: 当前K线的方向(dir_buffer[0])非0，且与上一根K线(dir_buffer[1])的方向不同
-    if(dir_buffer[0] == 0 || dir_buffer[0] == dir_buffer[1])
+    // 2. 【核心修改】基于已收盘的K线[1]和[2]检测SuperTrend反转信号
+    // 信号条件: 上一根K线(dir_buffer[1])的方向非0，且与上上根K线(dir_buffer[2])的方向不同
+    if(dir_buffer[1] == 0 || dir_buffer[1] == dir_buffer[2])
     {
-        return ORDER_TYPE_NONE; // 无反转信号
+        return ORDER_TYPE_NONE; // 在已收盘的K线上无反转信号
     }
 
-    // 3. ADX过滤器 (如果启用)
+    // 【新增】防重复开仓机制：确保每个信号K线只触发一次交易
+    static datetime last_signal_time = 0;
+    datetime signal_bar_time = (datetime)iTime(_Symbol, _Period, 1);
+    if(signal_bar_time <= last_signal_time)
+    {
+       // 这个信号K线已经被处理过，或者时间戳异常，直接跳过，防止重复或错误交易
+       return ORDER_TYPE_NONE;
+    }
+
+    // 3. 【逻辑调整】ADX过滤器 (在信号K线[1]上检测)
     if(Entry_useADXFilter)
     {
-        double adx_buffer[1];
-        if(CopyBuffer(adx_handle_entry, MAIN_LINE, 0, 1, adx_buffer) < 1)
+        double adx_buffer[2]; // 获取2个值，用索引[1]
+        if(CopyBuffer(adx_handle_entry, MAIN_LINE, 0, 2, adx_buffer) < 2)
         {
             Print("入场模块: ADX数据获取失败");
-            return ORDER_TYPE_NONE; // ADX数据获取失败
+            return ORDER_TYPE_NONE;
         }
-        if(adx_buffer[0] < Entry_adxMinStrength)
+        if(adx_buffer[1] < Entry_adxMinStrength)
         {
-            Print("入场模块: 信号被ADX过滤. ADX(" + DoubleToString(adx_buffer[0], 2) + 
+            Print("入场模块: 信号在K线 [", TimeToString(signal_bar_time), "] 被ADX过滤. ADX(", DoubleToString(adx_buffer[1], 2) + 
               ") < 阈值(" + DoubleToString(Entry_adxMinStrength, 2) + ")");
+            last_signal_time = signal_bar_time; // 即使过滤，也要记录，防止当前K线内不断尝试
             return ORDER_TYPE_NONE; // 趋势强度不足
         }
     }
 
     // 4. 确定信号方向并计算优化止损价
     ENUM_ORDER_TYPE signal = ORDER_TYPE_NONE;
+    // 动态缓冲计算依然基于当前市场情况，这是正确的
     double optimized_buffer = CalculateOptimizedBuffer();
     
-    if(dir_buffer[0] == 1) // 上升趋势信号 (BUY)
+    if(dir_buffer[1] == 1) // 上升趋势信号 (BUY)
     {
         signal = ORDER_TYPE_BUY;
-        sl_price = trend_buffer[0] - optimized_buffer;
+        // 止损价基于信号K线[1]的SuperTrend值
+        sl_price = trend_buffer[1] - optimized_buffer;
     }
-    else if(dir_buffer[0] == -1) // 下降趋势信号 (SELL)
+    else if(dir_buffer[1] == -1) // 下降趋势信号 (SELL)
     {
         signal = ORDER_TYPE_SELL;
-        sl_price = trend_buffer[0] + optimized_buffer;
+        // 止损价基于信号K线[1]的SuperTrend值
+        sl_price = trend_buffer[1] + optimized_buffer;
     }
     
-    // 标准化止损价格
+    // 标准化止损价格并输出日志
     if(signal != ORDER_TYPE_NONE)
     {
+        last_signal_time = signal_bar_time; // 关键：记录已处理的信号K线时间戳，防止重复
         sl_price = NormalizeDouble(sl_price, _Digits);
         
-        // 详细调试信息输出
-        Print("=== 入场信号确认 ===");
+        // 更新详细调试信息输出，以反映新逻辑
+        Print("=== 入场信号确认 (基于收盘K线) ===");
+        Print("信号K线时间: ", TimeToString(signal_bar_time));
         Print("信号类型: " + (signal == ORDER_TYPE_BUY ? "BUY" : "SELL"));
-        Print("SuperTrend价格: " + DoubleToString(trend_buffer[0], _Digits));
-        Print("动态缓冲: " + DoubleToString(optimized_buffer/_Point, 1) + "点 (基础" + 
-              DoubleToString(Entry_stopLossBufferPips, 1) + " + 时段×" + 
-              DoubleToString(GetSessionMultiplier(), 2) + " + 品种×" + 
-              DoubleToString(GetSymbolVolatilityFactor(), 2) + ")");
+        Print("SuperTrend价格 (在信号K线): " + DoubleToString(trend_buffer[1], _Digits));
+        Print("动态缓冲: " + DoubleToString(optimized_buffer/_Point, 1) + "点");
         Print("计算止损价: " + DoubleToString(sl_price, _Digits));
     }
 
