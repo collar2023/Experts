@@ -1,13 +1,15 @@
 //+------------------------------------------------------------------+
-//| SuperTrend EA – v3.1 (gemini安全止损 + 全局ATR句柄优化)           |
+//| SuperTrend EA – v4.0 (重大升级：二次进场的价格行为确认)          |
 //+------------------------------------------------------------------+
 //|                                     © 2025                       |
-//|  • 核心止损逻辑更新为：紧急止损作为“安全垫”，取更宽距离    |
-//|  • 性能优化：紧急ATR指标句柄在OnInit中统一创建，避免OnTick中重复  |
-//|  • 其余架构承接 v3.0                                             |
+//|  • 新增特性：引入基于价格行为的二次进场确认机制。                |
+//|    平仓后，EA会记录上次趋势的最高/最低点。                       |
+//|    只有当价格突破此关键点后，才允许在同方向再次进场。            |
+//|  • 核心目的：过滤盘整期的无效信号，只在趋势强力回归时追击。      |
+//|  • 架构升级：v3.1的稳健风控 + v4.0的智能入场过滤。               |
 //+------------------------------------------------------------------+
 #property copyright "© 2025"
-#property version   "3.1"
+#property version   "4.0"
 #property strict
 
 //===================== 模块引入 =====================================
@@ -22,14 +24,20 @@
 CLogModule* g_Logger = NULL;
 CTrade      g_trade;
 
+input group "--- Core Settings ---"
 input bool   EnableDebug             = true;
 input int    EmergencyATRPeriod      = 14;      // 用于紧急止损和信号过滤的ATR周期
 input double EmergencyATRMultiplier  = 1.5;     // 紧急止损 = ATR × 系数 (作为安全垫)
-input int    Entry_CooldownSeconds   = 0;       // 冷却期：开仓后至少等待 N 秒
+input int    Entry_CooldownSeconds   = 0;       // [兼容旧版] 冷却期：开仓后至少等待 N 秒
 input double MinATRMultipleToTrade   = 0.1;     // 原始 SL 距离需 ≥ ATR×系数
 
+//--- v4.0 全局变量: 用于价格行为确认 ---
+double       g_lastTrendHigh         = 0.0;     // **v4.0新增**: 记录上次多头趋势期间的最高点
+double       g_lastTrendLow          = 0.0;     // **v4.0新增**: 记录上次空头趋势期间的最低点
+
+//--- 其他全局变量 ---
 datetime     g_lastOpenTime          = 0;       // 上一次成功开仓时间
-int          g_emergencyAtrHandle    = INVALID_HANDLE; // **新增**: 全局紧急ATR句柄，用于性能优化
+int          g_emergencyAtrHandle    = INVALID_HANDLE; // 全局紧急ATR句柄
 
 bool   g_step1Done = false;
 bool   g_step2Done = false;
@@ -39,7 +47,7 @@ double g_initialSL = 0.0;
 double MarketBid() { double v; SymbolInfoDouble(_Symbol, SYMBOL_BID,  v); return v; }
 double MarketAsk() { double v; SymbolInfoDouble(_Symbol, SYMBOL_ASK, v); return v; }
 
-//===================== 新版开仓函数 (已整合方案A) =================================
+//===================== 开仓函数 (无修改，承接v3.1) =================================
 bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType,
                            double originalSL,
                            double tpPrice      = 0,
@@ -89,12 +97,10 @@ bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType,
    double finalSL;
    if(orderType == ORDER_TYPE_BUY)
    {
-      // 对于买单，最远的SL是价格更低的那个
       finalSL = MathMin(baseFinalSL, emergencySL); 
    }
    else
    {
-      // 对于卖单，最远的SL是价格更高的那个
       finalSL = MathMax(baseFinalSL, emergencySL);
    }
 
@@ -113,27 +119,19 @@ bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType,
    return true;
 }
 
-//===================== 安全应急 SL 计算 (方案A版) =============================
+//===================== 安全应急 SL 计算 (无修改，承接v3.1) =======================
 double GetSaferEmergencyStopLoss(double openP,
                                  double originalSL,
                                  ENUM_ORDER_TYPE orderType)
 {
-   // 1. 计算原始信号的风险距离
    double oriRisk = MathAbs(openP - originalSL);
-
-   // 2. 计算基于当前波动的ATR安全距离
    double atr[1];
-   double safeDist = oriRisk; // 默认等于原始风险
-
-   // **优化**: 使用全局句柄，不再临时创建，并检查ATR值是否有效
+   double safeDist = oriRisk; 
    if(g_emergencyAtrHandle != INVALID_HANDLE && CopyBuffer(g_emergencyAtrHandle, 0, 0, 1, atr) > 0 && atr[0] > 0)
    {
       double atrDist = atr[0] * EmergencyATRMultiplier;
-      // **核心修改**: 取原始风险和ATR风险中，距离更宽的那个作为安全距离
       safeDist = MathMax(oriRisk, atrDist); 
    }
-
-   // 3. 根据开仓价和最宽的安全距离，计算出止损价格
    return (orderType == ORDER_TYPE_BUY)
           ? (openP - safeDist)
           : (openP + safeDist);
@@ -145,7 +143,7 @@ int OnInit()
    if(!InitializeLogger(LOG_LEVEL_INFO))
    { Print("日志初始化失败"); return INIT_FAILED; }
 
-   g_Logger.WriteInfo("EA v3.1 启动 (方案A安全止损 + 全局ATR优化)");
+   g_Logger.WriteInfo("EA v4.0 启动 (重大升级：二次进场的价格行为确认)");
 
    InitRiskModule();
    if(!InitEntryModule(_Symbol, _Period))
@@ -153,7 +151,6 @@ int OnInit()
    if(!InitExitModule(_Symbol, _Period))
    { g_Logger.WriteError("出场模块初始化失败"); return INIT_FAILED; }
 
-   // **新增**: 初始化全局紧急ATR句柄
    g_emergencyAtrHandle = iATR(_Symbol, _Period, EmergencyATRPeriod);
    if(g_emergencyAtrHandle == INVALID_HANDLE)
    {
@@ -162,7 +159,7 @@ int OnInit()
    }
 
    ConfigureTrader(g_trade);
-   g_Logger.WriteInfo("架构: SuperTrend入场 · SAR/ADX出场 · 风控增强 (方案A)");
+   g_Logger.WriteInfo("架构: SuperTrend入场 · SAR/ADX出场 · 风控增强 · 智能过滤");
 
    return INIT_SUCCEEDED;
 }
@@ -174,7 +171,6 @@ void OnDeinit(const int reason)
    DeinitExitModule();
    DeinitRiskModule();
    
-   // **新增**: 释放全局句柄
    if(g_emergencyAtrHandle != INVALID_HANDLE)
    {
       IndicatorRelease(g_emergencyAtrHandle);
@@ -187,31 +183,61 @@ void OnDeinit(const int reason)
    }
 }
 
-//=========================== OnTick =================================
+//=========================== OnTick (核心修改区域) =================================
 void OnTick()
 {
-   /* ---- 冷却期控制 ---- */
-   if(g_lastOpenTime > 0 &&
-      TimeCurrent() - g_lastOpenTime < Entry_CooldownSeconds)
+   /* ---- 持仓管理优先 ---- */
+   if(PositionSelect(_Symbol)) 
+   { 
+      ManagePosition(); // ManagePosition内部已包含v4.0的逻辑
+      return; 
+   }
+
+   /* ---- 开仓前置检查 ---- */
+   if(!CanOpenNewTrade(EnableDebug)) return;
+
+   // [兼容旧版] 冷却期控制
+   if(g_lastOpenTime > 0 && TimeCurrent() - g_lastOpenTime < Entry_CooldownSeconds)
    {
-      // 为了简洁，调试信息可以按需保留或移除
-      // if(g_Logger != NULL && EnableDebug)
-      //    g_Logger.WriteInfo(StringFormat(
-      //       "仍在冷却期 (%d / %d 秒)，暂不重新开仓",
-      //       (int)(TimeCurrent() - g_lastOpenTime), Entry_CooldownSeconds));
       return;
    }
 
-   if(PositionSelect(_Symbol)) { ManagePosition(); return; }
-
-   if(!CanOpenNewTrade(EnableDebug)) return;
-
+   /* ---- 1. 获取原始信号 ---- */
    double sl_price = 0;
    ENUM_ORDER_TYPE sig = GetEntrySignal(sl_price);
    if(sig == ORDER_TYPE_NONE) return;
 
-   /* ---- ATR × MinMultiple 过滤 (已优化) ---- */
-   // **优化**: 使用全局句柄，不再临时创建
+   /* ---- 2. v4.0核心：基于价格行为的二次进场确认 ---- */
+   if(sig == ORDER_TYPE_BUY)
+   {
+      // 检查是否处于“二次做多观察模式” (即上次平掉的是多单)
+      if(g_lastTrendHigh > 0) 
+      {
+         // 确认价格是否已突破上次趋势的最高点，以证明趋势回归
+         if(MarketAsk() <= g_lastTrendHigh)
+         {
+            if(g_Logger != NULL && EnableDebug)
+               g_Logger.WriteInfo(StringFormat("二次做多信号过滤: 等待价格突破前高 %.5f", g_lastTrendHigh));
+            return; // 未突破，过滤信号，继续等待
+         }
+      }
+   }
+   else if(sig == ORDER_TYPE_SELL)
+   {
+      // 检查是否处于“二次做空观察模式” (即上次平掉的是空单)
+      if(g_lastTrendLow > 0)
+      {
+         // 确认价格是否已跌破上次趋势的最低点，以证明趋势回归
+         if(MarketBid() >= g_lastTrendLow)
+         {
+            if(g_Logger != NULL && EnableDebug)
+               g_Logger.WriteInfo(StringFormat("二次做空信号过滤: 等待价格跌破前低 %.5f", g_lastTrendLow));
+            return; // 未跌破，过滤信号，继续等待
+         }
+      }
+   }
+   
+   /* ---- 3. ATR × MinMultiple 距离过滤 ---- */
    if(g_emergencyAtrHandle != INVALID_HANDLE)
    {
       double atrBuf[1];
@@ -225,44 +251,75 @@ void OnTick()
          {
             if(g_Logger != NULL)
                g_Logger.WriteInfo(StringFormat(
-                 "⚠️ 信号过滤：SL仅 %.1f 点 < ATR×%.1f = %.1f 点，跳过开仓",
-                 distPts, MinATRMultipleToTrade, minDist));
+                 "⚠️ 信号过滤(ATR距离): SL仅 %.1f 点 < 最小要求 %.1f 点，跳过",
+                 distPts, minDist));
             return;
          }
       }
    }
 
+   /* ---- 4. 所有检查通过，执行开仓 ---- */
    OpenPosition(sig, sl_price);
 }
 
-//=========================== 开仓接口 ================================
+//=========================== 开仓接口 (v4.0 修改) ================================
 void OpenPosition(ENUM_ORDER_TYPE type, double sl)
 {
-   bool ok = OpenMarketOrder_Fixed(type, sl, 0, "ST-EA");
+   bool ok = OpenMarketOrder_Fixed(type, sl, 0, "ST-EA v4.0");
    if(ok)
    {
       g_initialSL   = sl;
       g_step1Done   = g_step2Done = false;
-      g_lastOpenTime = TimeCurrent();   // 记录开仓时间 → 开始冷却
+      g_lastOpenTime = TimeCurrent();
+      
+      // **v4.0新增**: 开仓成功后，重置“记忆”，为新的趋势周期做准备。
+      // 这意味着我们不再处于任何二次进场的观察模式中。
+      g_lastTrendHigh = 0.0;
+      g_lastTrendLow  = 0.0;
    }
 }
 
-//======================== 持仓管理函数 ===============================
+//======================== 持仓管理函数 (v4.0 修改) ===============================
 void ManagePosition()
 {
+   /* ---- v4.0新增：持仓期间，实时记录趋势的极值点 ---- */
+   // 这个动作是在为下一次可能的二次进场做准备，记录下当前趋势的“战绩高点”
+   ENUM_POSITION_TYPE pType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   if(pType == POSITION_TYPE_BUY)
+   {
+      double currentHigh = iHigh(_Symbol, _Period, 0); // 获取当前K线的最高价
+      // 如果是第一根K线或者创了新高，就更新记录
+      if(g_lastTrendHigh == 0.0 || currentHigh > g_lastTrendHigh)
+      {
+         g_lastTrendHigh = currentHigh;
+      }
+   }
+   else // POSITION_TYPE_SELL
+   {
+      double currentLow = iLow(_Symbol, _Period, 0); // 获取当前K线的最低价
+      // 如果是第一根K线或者创了新低，就更新记录
+      if(g_lastTrendLow == 0.0 || currentLow < g_lastTrendLow)
+      {
+         g_lastTrendLow = currentLow;
+      }
+   }
+
+   /* ---- 原有的出场逻辑 ---- */
    double openP = PositionGetDouble(POSITION_PRICE_OPEN);
    double vol   = PositionGetDouble(POSITION_VOLUME);
-   ENUM_POSITION_TYPE pType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-
+   
    double pct = (pType == POSITION_TYPE_BUY)
               ? GetLongExitAction(openP, g_initialSL, g_step1Done, g_step2Done)
               : GetShortExitAction(openP, g_initialSL, g_step1Done, g_step2Done);
    if(pct <= 0.0) return;
 
+   // 如果决定平仓，相应的 g_lastTrendHigh/Low 的值会被保留下来
+   // 作为下一次同向开仓的过滤器。
+   
    if(pct >= 100.0)
    {
       if(g_trade.PositionClose(_Symbol) && g_Logger != NULL)
-         g_Logger.WriteInfo("全仓平仓成功");
+         g_Logger.WriteInfo("全仓平仓成功，进入二次进场观察模式");
       return;
    }
 
