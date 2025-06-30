@@ -1,11 +1,12 @@
 //+------------------------------------------------------------------+
 //| SuperTrend EA – v3.0 (三位一体架构 + 紧急止损 1.5×ATR)           |
-//| 修正版：                                                         |
-//|  • 移除非法引用语法                                             |
-//|  • 所有逻辑与 g_Logger 判断改为 “g_Logger!=NULL && …”            |
+//| 冷却期 + ATR‑距离过滤版：                                       |
+//|  • 冷却期 Entry_CooldownSeconds（默认 300 秒）                  |
+//|  • 新增 MinATRMultipleToTrade：SL 至少 ≥ ATR×系数              |
+//|  • 若原始 SL < 阈值 → 直接过滤信号，日志提示                   |
 //+------------------------------------------------------------------+
 #property copyright "© 2025"
-#property version   "3.00"
+#property version   "3.02"
 #property strict
 
 //===================== 模块引入 =====================================
@@ -20,9 +21,12 @@
 CLogModule* g_Logger = NULL;
 CTrade      g_trade;
 
-input bool   EnableDebug            = true;
-input int    EmergencyATRPeriod     = 14;
-input double EmergencyATRMultiplier = 1.5;
+input bool   EnableDebug             = true;
+input int    EmergencyATRPeriod      = 14;
+input double EmergencyATRMultiplier  = 1.5;
+input int    Entry_CooldownSeconds   = 0;   // 冷却期：开仓后至少等待 N 秒
+input double MinATRMultipleToTrade   = 0.1;   // 原始 SL 距离需 ≥ ATR×系数
+datetime     g_lastOpenTime          = 0;     // 上一次成功开仓时间
 
 bool   g_step1Done = false;
 bool   g_step2Done = false;
@@ -123,7 +127,7 @@ int OnInit()
    if(!InitializeLogger(LOG_LEVEL_INFO))
    { Print("日志初始化失败"); return INIT_FAILED; }
 
-   g_Logger.WriteInfo("EA v3.0 启动成功 (修正版)");
+   g_Logger.WriteInfo("EA v3.02 启动成功 (冷却期+ATR过滤)");
 
    InitRiskModule();
    if(!InitEntryModule(_Symbol, _Period))
@@ -154,6 +158,17 @@ void OnDeinit(const int reason)
 //=========================== OnTick =================================
 void OnTick()
 {
+   /* ---- 冷却期控制 ---- */
+   if(g_lastOpenTime > 0 &&
+      TimeCurrent() - g_lastOpenTime < Entry_CooldownSeconds)
+   {
+      if(g_Logger != NULL && EnableDebug)
+         g_Logger.WriteInfo(StringFormat(
+            "仍在冷却期 (%d / %d 秒)，暂不重新开仓",
+            (int)(TimeCurrent() - g_lastOpenTime), Entry_CooldownSeconds));
+      return;
+   }
+
    if(PositionSelect(_Symbol)) { ManagePosition(); return; }
 
    if(!CanOpenNewTrade(EnableDebug)) return;
@@ -161,6 +176,30 @@ void OnTick()
    double sl_price = 0;
    ENUM_ORDER_TYPE sig = GetEntrySignal(sl_price);
    if(sig == ORDER_TYPE_NONE) return;
+
+   /* ---- ATR × MinMultiple 过滤 ---- */
+   int atrH = iATR(_Symbol, _Period, EmergencyATRPeriod);
+   if(atrH != INVALID_HANDLE)
+   {
+      double atrBuf[1];
+      if(CopyBuffer(atrH,0,0,1,atrBuf) > 0)
+      {
+         double price = (sig == ORDER_TYPE_BUY) ? MarketAsk() : MarketBid();
+         double distPts = MathAbs(price - sl_price) / _Point;
+         double minDist = (atrBuf[0] / _Point) * MinATRMultipleToTrade;
+
+         if(distPts < minDist)
+         {
+            if(g_Logger != NULL)
+               g_Logger.WriteInfo(StringFormat(
+                 "⚠️ 信号过滤：SL仅 %.1f 点 < ATR×%.1f = %.1f 点，跳过开仓",
+                 distPts, MinATRMultipleToTrade, minDist));
+            IndicatorRelease(atrH);
+            return;
+         }
+      }
+      IndicatorRelease(atrH);
+   }
 
    OpenPosition(sig, sl_price);
 }
@@ -171,8 +210,9 @@ void OpenPosition(ENUM_ORDER_TYPE type, double sl)
    bool ok = OpenMarketOrder_Fixed(type, sl, 0, "ST-EA");
    if(ok)
    {
-      g_initialSL = sl;
-      g_step1Done = g_step2Done = false;
+      g_initialSL   = sl;
+      g_step1Done   = g_step2Done = false;
+      g_lastOpenTime = TimeCurrent();   // 记录开仓时间 → 开始冷却
    }
 }
 
