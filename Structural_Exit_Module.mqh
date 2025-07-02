@@ -1,7 +1,9 @@
 //+------------------------------------------------------------------+
-//| Structural_Exit_Module.mqh v1.8 (2025‑07‑06)                     |
-//| ★ v1.8: 降频优化版 - 结构化止损降到K线级别，保本操作保持tick级别   |
-//|   解决过于敏感导致趋势行情走不出来的问题                          |
+//| Structural_Exit_Module.mqh v1.9 (2025‑07‑08)                     |
+//| ★ v1.9: 请求冷却版 - 引入时间锁，解决重复修改失败和10036刷屏问题 |
+//|   在发送修改请求后，增加一个短暂的冷却期，避免因状态同步延迟     |
+//|   导致向服务器发送大量重复的、无效的指令。                       |
+//|   继承 v1.8 所有降频和时间保护功能。                             |
 //+------------------------------------------------------------------+
 #property strict
 //==================================================================
@@ -20,27 +22,30 @@ struct SStructuralExitInputs
    int    ATRTrailPeriod;
    double ATRTrailMultiplier;
    
-   // ★ 新增：更新频率控制 (仅针对结构化止损)
-   int    UpdateFrequency;  // 0=每tick, 1=每K线, 2=每N根K线
-   int    UpdateInterval;   // 当UpdateFrequency=2时，每N根K线更新一次
+   int    UpdateFrequency;
+   int    UpdateInterval;
    
-   // ★ 新增：时间保护期设置
-   int    CooldownBars;     // 冷却K线数：持仓开启后N根K线内不更新结构化止损
-   int    MinHoldBars;      // 最小持仓K线数：持仓N根K线后才允许结构化出场
+   int    CooldownBars;
+   int    MinHoldBars;
 };
+
 //==================================================================
 //  模块内部句柄与静态变量
 //==================================================================
 static int se_fractalHandle = INVALID_HANDLE;
 static int se_atrHandle     = INVALID_HANDLE;
-// ★★★ v1.8 核心新增: K线级别控制变量 (仅用于结构化止损) ★★★
-static datetime se_last_processed_bar = 0;    // 上次处理结构化止损的K线时间
-static int      se_bar_counter = 0;           // K线计数器
+static datetime se_last_processed_bar = 0;
+static int      se_bar_counter = 0;
 static double   se_last_failed_sl = 0;
 static datetime se_last_failed_bar_time = 0;
-// ★★★ v1.8 时间保护期变量 ★★★
-static datetime se_position_open_time = 0;    // 记录持仓开启时间
-static int      se_position_hold_bars = 0;    // 持仓经历的K线数
+static datetime se_position_open_time = 0;
+static int      se_position_hold_bars = 0;
+
+// ★★★ v1.9 核心新增: 请求冷却机制变量 ★★★
+static ulong    se_last_modify_request_ticket = 0; // 记录上次发送修改请求的票据
+static datetime se_last_modify_request_time = 0; // 记录上次发送修改请求的时间
+
+
 //==================================================================
 //  模块初始化与清理
 //==================================================================
@@ -65,15 +70,17 @@ bool InitStructuralExitModule(const SStructuralExitInputs &in)
       }
    }
    
-   // 重置所有控制变量
    se_last_processed_bar = 0;
    se_bar_counter = 0;
    se_last_failed_sl = 0;
    se_last_failed_bar_time = 0;
    se_position_open_time = 0;
    se_position_hold_bars = 0;
+   // 初始化请求冷却变量
+   se_last_modify_request_ticket = 0;
+   se_last_modify_request_time = 0;
    
-   Print("[SE] 模块 v1.8 初始化完成 (降频+冷却优化版)");
+   Print("[SE] 模块 v1.9 初始化完成 (请求冷却终极版)");
    Print("[SE] 保本操作: 每tick更新 (快速响应)");
    Print("[SE] 结构化止损更新频率: ", (in.UpdateFrequency==0?"每tick":in.UpdateFrequency==1?"每K线":"每"+IntegerToString(in.UpdateInterval)+"根K线"));
    Print("[SE] 冷却期: ", in.CooldownBars, " 根K线");
@@ -103,22 +110,16 @@ bool ShouldUpdateStructuralStop(const SStructuralExitInputs &in)
 {
    datetime current_bar = iTime(_Symbol, _Period, 0);
    
-   // 如果是每tick更新，直接返回true
    if(in.UpdateFrequency == 0) return true;
    
-   // 如果是新K线，更新计数器
    if(current_bar != se_last_processed_bar)
    {
       se_bar_counter++;
-      
-      // 每K线更新
       if(in.UpdateFrequency == 1)
       {
          se_last_processed_bar = current_bar;
          return true;
       }
-      
-      // 每N根K线更新
       if(in.UpdateFrequency == 2 && se_bar_counter >= in.UpdateInterval)
       {
          se_bar_counter = 0;
@@ -137,11 +138,9 @@ bool IsInCooldownPeriod(const SStructuralExitInputs &in)
 {
    if(se_position_open_time == 0) return false;
    
-   // 计算持仓经历的K线数
    int bars_passed = Bars(_Symbol, _Period, se_position_open_time, TimeCurrent());
    se_position_hold_bars = bars_passed;
    
-   // 检查是否在冷却期内
    if(bars_passed < in.CooldownBars)
    {
       return true;
@@ -172,6 +171,9 @@ bool ProcessBreakeven(const SStructuralExitInputs &in, ulong ticket)
    
    double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
    double current_sl = PositionGetDouble(POSITION_SL);
+   double initial_sl = PositionGetDouble(POSITION_SL); // Assuming initial SL is set correctly on position open
+   if(initial_sl == 0) return false; // Cannot calculate RR without initial SL
+
    double current_price = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 
                          SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
                          SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -179,24 +181,23 @@ bool ProcessBreakeven(const SStructuralExitInputs &in, ulong ticket)
    ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   double buffer = in.BreakevenBufferPips * point * ((digits == 5 || digits == 3) ? 10 : 1);
-   
+   double buffer = in.BreakevenBufferPips * point;
+
    double profit_pips, required_pips, new_sl;
    
    if(pos_type == POSITION_TYPE_BUY)
    {
-      profit_pips = (current_price - entry_price) / point;
-      required_pips = (entry_price - current_sl) / point * in.BreakevenTriggerRR;
+      profit_pips = (current_price - entry_price);
+      required_pips = (entry_price - initial_sl) * in.BreakevenTriggerRR;
       
       if(profit_pips >= required_pips)
       {
          new_sl = entry_price + buffer;
-         if(new_sl > current_sl && new_sl < current_price - buffer)
+         if(new_sl > current_sl)
          {
             if(ModifyPosition(ticket, new_sl))
             {
-               Print("[SE] ✓ 保本止损已设置: ", DoubleToString(new_sl, digits),
-                     " (利润:", DoubleToString(profit_pips, 1), "pips)");
+               Print("[SE] ✓ 保本止损已设置: ", DoubleToString(new_sl, digits));
                return true;
             }
          }
@@ -204,18 +205,17 @@ bool ProcessBreakeven(const SStructuralExitInputs &in, ulong ticket)
    }
    else if(pos_type == POSITION_TYPE_SELL)
    {
-      profit_pips = (entry_price - current_price) / point;
-      required_pips = (current_sl - entry_price) / point * in.BreakevenTriggerRR;
+      profit_pips = (entry_price - current_price);
+      required_pips = (initial_sl - entry_price) * in.BreakevenTriggerRR;
       
       if(profit_pips >= required_pips)
       {
          new_sl = entry_price - buffer;
-         if((current_sl == 0 || new_sl < current_sl) && new_sl > current_price + buffer)
+         if((current_sl == 0 || new_sl < current_sl))
          {
             if(ModifyPosition(ticket, new_sl))
             {
-               Print("[SE] ✓ 保本止损已设置: ", DoubleToString(new_sl, digits),
-                     " (利润:", DoubleToString(profit_pips, 1), "pips)");
+               Print("[SE] ✓ 保本止损已设置: ", DoubleToString(new_sl, digits));
                return true;
             }
          }
@@ -231,16 +231,8 @@ bool ProcessBreakeven(const SStructuralExitInputs &in, ulong ticket)
 bool ProcessStructuralStop(const SStructuralExitInputs &in, ulong ticket)
 {
    if(!in.EnableStructureStop) return false;
-   
-   // ★★★ 频率控制：只在指定频率下更新结构化止损 ★★★
    if(!ShouldUpdateStructuralStop(in)) return false;
-   
-   // ★★★ 时间保护期检查 ★★★
-   if(IsInCooldownPeriod(in))
-   {
-      // Print("[SE] 结构化止损暂停: 冷却期内 (", se_position_hold_bars, "/", in.CooldownBars, " 根K线)");
-      return false;
-   }
+   if(IsInCooldownPeriod(in)) return false;
    
    if(!PositionSelectByTicket(ticket))
    {
@@ -252,15 +244,14 @@ bool ProcessStructuralStop(const SStructuralExitInputs &in, ulong ticket)
    double current_sl = PositionGetDouble(POSITION_SL);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   double buffer = in.StructureBufferPips * point * ((digits == 5 || digits == 3) ? 10 : 1);
+   double buffer = in.StructureBufferPips * point;
    
-   // 获取分形数据
    double fractal_up[], fractal_down[];
    ArraySetAsSeries(fractal_up, true);
    ArraySetAsSeries(fractal_down, true);
    
-   if(CopyBuffer(se_fractalHandle, 0, 0, in.StructureLookback + 10, fractal_up) <= 0 ||
-      CopyBuffer(se_fractalHandle, 1, 0, in.StructureLookback + 10, fractal_down) <= 0)
+   if(CopyBuffer(se_fractalHandle, 0, 1, in.StructureLookback, fractal_up) <= 0 ||
+      CopyBuffer(se_fractalHandle, 1, 1, in.StructureLookback, fractal_down) <= 0)
    {
       Print("[SE] 结构化止损错误: 无法获取分形数据");
       return false;
@@ -270,79 +261,41 @@ bool ProcessStructuralStop(const SStructuralExitInputs &in, ulong ticket)
    
    if(pos_type == POSITION_TYPE_BUY)
    {
-      // 寻找最近的下分形
-      for(int i = 2; i < ArraySize(fractal_down) && i < in.StructureLookback + 10; i++)
+      for(int i = 0; i < ArraySize(fractal_down); i++)
       {
-         if(fractal_down[i] != EMPTY_VALUE && fractal_down[i] > 0)
+         if(fractal_down[i] > 0)
          {
             new_sl = fractal_down[i] - buffer;
             break;
          }
       }
       
-      // 验证新止损
       if(new_sl > 0 && new_sl > current_sl)
       {
-         double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         if(new_sl < current_price - buffer)
+         if(ModifyPosition(ticket, new_sl))
          {
-            // 防止频繁失败
-            if(new_sl == se_last_failed_sl && 
-               TimeCurrent() - se_last_failed_bar_time < PeriodSeconds(_Period) * 3)
-            {
-               return false;
-            }
-            
-            if(ModifyPosition(ticket, new_sl))
-            {
-               Print("[SE] ✓ 结构化止损已更新 (买单): ", DoubleToString(new_sl, digits));
-               se_last_failed_sl = 0;
-               return true;
-            }
-            else
-            {
-               se_last_failed_sl = new_sl;
-               se_last_failed_bar_time = TimeCurrent();
-            }
+            Print("[SE] ✓ 结构化止损已更新 (买单): ", DoubleToString(new_sl, digits));
+            return true;
          }
       }
    }
    else if(pos_type == POSITION_TYPE_SELL)
    {
-      // 寻找最近的上分形
-      for(int i = 2; i < ArraySize(fractal_up) && i < in.StructureLookback + 10; i++)
+      for(int i = 0; i < ArraySize(fractal_up); i++)
       {
-         if(fractal_up[i] != EMPTY_VALUE && fractal_up[i] > 0)
+         if(fractal_up[i] > 0)
          {
             new_sl = fractal_up[i] + buffer;
             break;
          }
       }
       
-      // 验证新止损
       if(new_sl > 0 && (current_sl == 0 || new_sl < current_sl))
       {
-         double current_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         if(new_sl > current_price + buffer)
+         if(ModifyPosition(ticket, new_sl))
          {
-            // 防止频繁失败
-            if(new_sl == se_last_failed_sl && 
-               TimeCurrent() - se_last_failed_bar_time < PeriodSeconds(_Period) * 3)
-            {
-               return false;
-            }
-            
-            if(ModifyPosition(ticket, new_sl))
-            {
-               Print("[SE] ✓ 结构化止损已更新 (卖单): ", DoubleToString(new_sl, digits));
-               se_last_failed_sl = 0;
-               return true;
-            }
-            else
-            {
-               se_last_failed_sl = new_sl;
-               se_last_failed_bar_time = TimeCurrent();
-            }
+            Print("[SE] ✓ 结构化止损已更新 (卖单): ", DoubleToString(new_sl, digits));
+            return true;
          }
       }
    }
@@ -356,8 +309,6 @@ bool ProcessStructuralStop(const SStructuralExitInputs &in, ulong ticket)
 bool ProcessATRTrail(const SStructuralExitInputs &in, ulong ticket)
 {
    if(!in.EnableATRFallback) return false;
-   
-   // ★★★ ATR跟踪止损也使用相同的频率控制 ★★★
    if(!ShouldUpdateStructuralStop(in)) return false;
    
    if(!PositionSelectByTicket(ticket))
@@ -369,7 +320,7 @@ bool ProcessATRTrail(const SStructuralExitInputs &in, ulong ticket)
    double atr_values[];
    ArraySetAsSeries(atr_values, true);
    
-   if(CopyBuffer(se_atrHandle, 0, 0, 2, atr_values) <= 0)
+   if(CopyBuffer(se_atrHandle, 0, 0, 1, atr_values) <= 0)
    {
       Print("[SE] ATR跟踪止损错误: 无法获取ATR数据");
       return false;
@@ -421,6 +372,9 @@ void RecordPositionOpen(ulong ticket)
 {
    se_position_open_time = TimeCurrent();
    se_position_hold_bars = 0;
+   // 开仓时也重置冷却计时器
+   se_last_modify_request_ticket = 0;
+   se_last_modify_request_time = 0;
    Print("[SE] 持仓已记录: ", ticket, " 开启时间: ", TimeToString(se_position_open_time));
 }
 
@@ -428,6 +382,9 @@ void ResetPositionRecord()
 {
    se_position_open_time = 0;
    se_position_hold_bars = 0;
+   // ★★★ v1.9 新增：重置冷却状态 ★★★
+   se_last_modify_request_ticket = 0;
+   se_last_modify_request_time = 0;
    //Print("[SE] 持仓记录已重置");
 }
 
@@ -440,19 +397,18 @@ bool ProcessStructuralExit(const SStructuralExitInputs &in, ulong ticket)
    
    bool any_action = false;
    
-   // ★★★ 保本操作始终在tick级别快速响应 ★★★
    if(ProcessBreakeven(in, ticket))
    {
       any_action = true;
    }
    
-   // ★★★ 结构化止损在指定频率下更新 ★★★
+   if(!IsMinHoldTimeMet(in)) return any_action; // 最小持仓K线数检查
+   
    if(ProcessStructuralStop(in, ticket))
    {
       any_action = true;
    }
    
-   // ★★★ ATR跟踪止损也在指定频率下更新 ★★★
    if(!any_action && ProcessATRTrail(in, ticket))
    {
       any_action = true;
@@ -466,6 +422,12 @@ bool ProcessStructuralExit(const SStructuralExitInputs &in, ulong ticket)
 //==================================================================
 bool ModifyPosition(ulong ticket, double new_sl, double new_tp = 0)
 {
+   // ★★★ v1.9 核心逻辑：请求冷却的“节流阀” ★★★
+   if(ticket == se_last_modify_request_ticket && TimeCurrent() - se_last_modify_request_time < 5) // 5秒冷却期
+   {
+      return false; // 请求过于频繁，跳过
+   }
+
    MqlTradeRequest request = {};
    MqlTradeResult result = {};
    
@@ -475,11 +437,22 @@ bool ModifyPosition(ulong ticket, double new_sl, double new_tp = 0)
       return false;
    }
    
+   // 第二层保护: 如果目标SL和当前SL已经一样，也没必要发送
+   double current_server_sl = PositionGetDouble(POSITION_SL);
+   if(NormalizeDouble(new_sl, _Digits) == NormalizeDouble(current_server_sl, _Digits))
+   {
+       return true; // 任务已完成
+   }
+
    request.action = TRADE_ACTION_SLTP;
    request.symbol = PositionGetString(POSITION_SYMBOL);
    request.sl = new_sl;
    request.tp = (new_tp == 0) ? PositionGetDouble(POSITION_TP) : new_tp;
    request.magic = PositionGetInteger(POSITION_MAGIC);
+   
+   // ★★★ v1.9 核心逻辑：发送前记录状态 ★★★
+   se_last_modify_request_ticket = ticket;
+   se_last_modify_request_time = TimeCurrent();
    
    if(!OrderSend(request, result))
    {
@@ -487,5 +460,6 @@ bool ModifyPosition(ulong ticket, double new_sl, double new_tp = 0)
       return false;
    }
    
+   Print("[SE] ✓ 修改请求已发送: SL->", DoubleToString(new_sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS)));
    return true;
 }

@@ -23,7 +23,7 @@ CLogModule* g_Logger = NULL;
 CTrade      g_trade;
 
 input group "--- Core Settings ---"
-input bool   ST_Debug             = true;
+input bool   EnableDebug             = true;
 input int    EmergencyATRPeriod      = 14;
 input double EmergencyATRMultiplier  = 1.5;
 input int    Entry_CooldownSeconds   = 0;
@@ -72,7 +72,7 @@ bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType,
    double lot = CalculateLotSize(originalSL, orderType);
    if(lot <= 0.0)
    {
-      if(g_Logger != NULL && ST_Debug) g_Logger.WriteWarning("风控后手数=0，跳过交易");
+      if(g_Logger != NULL && EnableDebug) g_Logger.WriteWarning("风控后手数=0，跳过交易");
       return false;
    }
 
@@ -170,13 +170,13 @@ void OnTick()
       // 增加对无SL仓位的保护性检查
       if(PositionGetDouble(POSITION_SL) == 0)
       {
-         if(g_Logger && ST_Debug) g_Logger.WriteWarning("检测到无SL的持仓，请关注！");
+         if(g_Logger && EnableDebug) g_Logger.WriteWarning("检测到无SL的持仓，请关注！");
       }
       ManagePosition();
       return; 
    }
 
-   if(!CanOpenNewTrade(ST_Debug)) return;
+   if(!CanOpenNewTrade(EnableDebug)) return;
    if(g_lastOpenTime > 0 && TimeCurrent() - g_lastOpenTime < Entry_CooldownSeconds) return;
 
    double sl_price = 0;
@@ -187,7 +187,7 @@ void OnTick()
    {
       if(g_lastTrendHigh > 0 && MarketAsk() <= g_lastTrendHigh)
       {
-         if(g_Logger != NULL && ST_Debug) g_Logger.WriteInfo(StringFormat("二次做多信号过滤: 等待价格突破前高 %.5f", g_lastTrendHigh));
+         if(g_Logger != NULL && EnableDebug) g_Logger.WriteInfo(StringFormat("二次做多信号过滤: 等待价格突破前高 %.5f", g_lastTrendHigh));
          return;
       }
    }
@@ -195,7 +195,7 @@ void OnTick()
    {
       if(g_lastTrendLow > 0 && MarketBid() >= g_lastTrendLow)
       {
-         if(g_Logger != NULL && ST_Debug) g_Logger.WriteInfo(StringFormat("二次做空信号过滤: 等待价格跌破前低 %.5f", g_lastTrendLow));
+         if(g_Logger != NULL && EnableDebug) g_Logger.WriteInfo(StringFormat("二次做空信号过滤: 等待价格跌破前低 %.5f", g_lastTrendLow));
          return;
       }
    }

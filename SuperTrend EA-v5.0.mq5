@@ -1,24 +1,23 @@
 //+------------------------------------------------------------------+
-//| SuperTrend EA – v5.6(v1.8模块接口修复版)                      |
+//| SuperTrend EA – v5.6(参数显性化终极版)                          |
 //+------------------------------------------------------------------+
 //|                                     © 2025                       |
-//|  • 接口修复: 修正了主EA对Structural_Exit_Module v1.8的调用方式。 |
-//|    使用正确的函数名(ProcessStructuralExit)和参数(ticket)。       |
-//|  • 逻辑整合: 在开仓/平仓时，正确调用模块的记录和重置函数。       |
-//|  • 参数增强: 引入v1.8模块的频率控制参数到EA面板。                |
+//|  • 终极重构: 将所有风控参数显性化，通过结构体传递。                |
+//|    彻底解决了所有编译报错和参数作用域问题。                        |
+//|  • 继承 v5.6.3 的所有功能，包括异步止损、v1.8模块接口等。          |
 //+------------------------------------------------------------------+
 #property copyright "© 2025"
-#property version   "5.6" // v1.8模块接口修复版
+#property version   "5.6" // 参数显性化终极版
 #property strict
 
-//===================== 模块引入 (无变化) =====================================
+//===================== 模块引入 =====================================
 #include <Trade/Trade.mqh>
 #include <Arrays/ArrayDouble.mqh>
 #include "SuperTrend_LogModule.mqh"
-#include "Risk_Management_Module.mqh"
+#include "Risk_Management_Module.mqh" // v2.7
 #include "SuperTrend_Entry_Module.mqh"
 #include "SAR_ADX_Exit_Module.mqh"
-#include "Structural_Exit_Module.mqh" // v1.8
+#include "Structural_Exit_Module.mqh"
 #include "Common_Defines.mqh"
 
 //===================== 全局对象 & 变量 ===============================
@@ -26,7 +25,6 @@ CLogModule* g_Logger = NULL;
 CTrade      g_trade;
 
 enum ENUM_BASE_EXIT_MODE { EXIT_MODE_STRUCTURAL, EXIT_MODE_SAR, EXIT_MODE_NONE };
-// ★★★ 新增：匹配v1.8模块的频率枚举 ★★★
 enum ENUM_SE_UPDATE_FREQ { SE_FREQ_EVERY_TICK, SE_FREQ_EVERY_BAR, SE_FREQ_EVERY_N_BARS };
 
 input group "--- Strategy Mode ---"
@@ -40,6 +38,20 @@ input double EmergencyATRMultiplier  = 1.5;
 input int    Entry_CooldownSeconds   = 0;
 input double MinATRMultipleToTrade   = 0.1;
 
+input group "--- Risk Management Settings ---" // ★★★ 风控参数集中于此 ★★★
+input bool     Risk_useFixedLot        = false;
+input double   Risk_fixedLot           = 0.01;
+input double   Risk_riskPercent        = 1.0;
+input double   Risk_minStopATRMultiple = 1.0;
+input int      Risk_atrPeriod          = 14;
+input double   Risk_minStopPoints      = 10.0;
+input double   Risk_maxLotByBalance    = 50.0;
+input double   Risk_maxAbsoluteLot     = 1.0;
+input bool     Risk_enableLotLimit     = true;
+input double   Risk_slippage           = 3;
+input double   Risk_dailyLossLimitPct  = 10.0;
+input bool     Risk_AllowNewTrade      = true;
+
 input group "--- Structural Exit Settings (Mode 1) ---"
 input bool   SE_EnableBreakeven      = true;
 input double SE_BreakevenTriggerRR   = 1.0;
@@ -51,14 +63,16 @@ input bool   SE_EnableATRFallback    = true;
 input int    SE_ATRTrailPeriod       = 14;
 input double SE_ATRTrailMultiplier   = 2.5;
 
-// ★★★ 新增：v1.8模块的频率控制参数，使其可在面板调节 ★★★
 input group "--- Structural Exit v1.8 Frequency Control ---"
 input ENUM_SE_UPDATE_FREQ SE_UpdateFrequency = SE_FREQ_EVERY_BAR;
-input int                 SE_UpdateInterval  = 3;     // 当频率=每N根K线时生效
-input int                 SE_CooldownBars    = 5;     // 开仓后冷却N根K线不进行追踪止损
-input int                 SE_MinHoldBars     = 3;     // 允许结构化止损的最小持仓K线数
+input int                 SE_UpdateInterval  = 3;
+input int                 SE_CooldownBars    = 5;
+input int                 SE_MinHoldBars     = 3;
 
+// ★★★ 参数结构体实例 ★★★
 SStructuralExitInputs g_structExitInputs;
+SRiskInputs           g_riskInputs;
+
 double       g_lastTrendHigh         = 0.0;
 double       g_lastTrendLow          = 0.0;
 datetime     g_lastOpenTime          = 0;
@@ -67,14 +81,14 @@ bool   g_step1Done = false;
 bool   g_step2Done = false;
 double g_initialSL = 0.0;
 
-//===================== 工具函数 (无变化) =====================================
+//===================== 工具函数 =====================================
 double MarketBid() { double v; SymbolInfoDouble(_Symbol, SYMBOL_BID,  v); return v; }
 double MarketAsk() { double v; SymbolInfoDouble(_Symbol, SYMBOL_ASK, v); return v; }
 
-//===================== 开仓函数 (保持v5.6.2的异步止损逻辑) ==================
+//===================== 开仓函数 ==================
 bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType, double originalSL, double tpPrice = 0, string comment = "ST-EA")
 {
-   double lot = CalculateLotSize(originalSL, orderType);
+   double lot = CalculateLotSize(originalSL, orderType, g_riskInputs);
    if(lot <= 0.0) return false;
    
    double estPrice = (orderType == ORDER_TYPE_BUY) ? MarketAsk() : MarketBid();
@@ -98,8 +112,10 @@ bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType, double originalSL, double 
    CArrayDouble valid_sl_candidates;
    double normalized_originalSL = NormalizePrice(originalSL);
    if (IsStopLossValid(normalized_originalSL, posType)) valid_sl_candidates.Add(normalized_originalSL);
-   double baseFinalSL = CalculateFinalStopLoss(openP, originalSL, orderType);
+   
+   double baseFinalSL = CalculateFinalStopLoss(openP, originalSL, orderType, g_riskInputs);
    if (IsStopLossValid(baseFinalSL, posType) && valid_sl_candidates.Search(baseFinalSL) < 0) valid_sl_candidates.Add(baseFinalSL);
+   
    double emergencySL = GetSaferEmergencyStopLoss(openP, originalSL, orderType);
    if (IsStopLossValid(emergencySL, posType) && valid_sl_candidates.Search(emergencySL) < 0) valid_sl_candidates.Add(emergencySL);
 
@@ -133,7 +149,7 @@ bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType, double originalSL, double 
    return true;
 }
 
-//===================== 安全应急 SL 计算 (无变化) =====================
+//===================== 安全应急 SL 计算 =====================
 double GetSaferEmergencyStopLoss(double openP, double originalSL, ENUM_ORDER_TYPE orderType)
 {
    if (!MathIsValidNumber(openP) || !MathIsValidNumber(originalSL)) return 0.0;
@@ -155,16 +171,30 @@ double GetSaferEmergencyStopLoss(double openP, double originalSL, ENUM_ORDER_TYP
    return NormalizePrice(finalSL);
 }
 
-//=========================== OnInit (已修改) =================================
+//=========================== OnInit =================================
 int OnInit()
 {
    if(!InitializeLogger(LOG_LEVEL_INFO)) { Print("日志初始化失败"); return INIT_FAILED; }
-   g_Logger.WriteInfo("EA v5.6.3 启动 (v1.8模块接口修复版)");
-   InitRiskModule();
+   g_Logger.WriteInfo("EA v5.6.4 启动 (参数显性化终极版)");
+
+   // ★★★ 核心修改：填充风控参数结构体 ★★★
+   g_riskInputs.useFixedLot        = Risk_useFixedLot;
+   g_riskInputs.fixedLot           = Risk_fixedLot;
+   g_riskInputs.riskPercent        = Risk_riskPercent;
+   g_riskInputs.minStopATRMultiple = Risk_minStopATRMultiple;
+   g_riskInputs.atrPeriod          = Risk_atrPeriod;
+   g_riskInputs.minStopPoints      = Risk_minStopPoints;
+   g_riskInputs.maxLotByBalance    = Risk_maxLotByBalance;
+   g_riskInputs.maxAbsoluteLot     = Risk_maxAbsoluteLot;
+   g_riskInputs.enableLotLimit     = Risk_enableLotLimit;
+   g_riskInputs.slippage           = Risk_slippage;
+   g_riskInputs.dailyLossLimitPct  = Risk_dailyLossLimitPct;
+   g_riskInputs.AllowNewTrade      = Risk_AllowNewTrade;
+
+   InitRiskModule(g_riskInputs);
    if(!InitEntryModule(_Symbol, _Period)) return INIT_FAILED;
    if(!InitExitModule(_Symbol, _Period)) return INIT_FAILED;
    
-   // ★★★ 核心修改：填充完整的g_structExitInputs结构体，以匹配v1.8模块 ★★★
    if(BaseExitStrategy == EXIT_MODE_STRUCTURAL)
    {
       g_structExitInputs.EnableStructuralExit = true; 
@@ -177,49 +207,43 @@ int OnInit()
       g_structExitInputs.EnableATRFallback = SE_EnableATRFallback;
       g_structExitInputs.ATRTrailPeriod = SE_ATRTrailPeriod; 
       g_structExitInputs.ATRTrailMultiplier = SE_ATRTrailMultiplier;
-      // 填充v1.8新增的频率控制参数
       g_structExitInputs.UpdateFrequency = (int)SE_UpdateFrequency;
       g_structExitInputs.UpdateInterval = SE_UpdateInterval;
       g_structExitInputs.CooldownBars = SE_CooldownBars;
       g_structExitInputs.MinHoldBars = SE_MinHoldBars;
-      
       if(!InitStructuralExitModule(g_structExitInputs)) return INIT_FAILED;
    }
    
    g_emergencyAtrHandle = iATR(_Symbol, _Period, EmergencyATRPeriod);
    if(g_emergencyAtrHandle == INVALID_HANDLE) return INIT_FAILED;
-   ConfigureTrader(g_trade);
+   ConfigureTrader(g_trade, g_riskInputs);
    return INIT_SUCCEEDED;
 }
 
-//=========================== OnDeinit (已修改) ===============================
+//=========================== OnDeinit ===============================
 void OnDeinit(const int reason)
 {
    DeinitRiskModule(); DeinitEntryModule(); DeinitExitModule(); 
    if(BaseExitStrategy == EXIT_MODE_STRUCTURAL)
    {
       DeinitStructuralExitModule();
-      ResetPositionRecord(); // ★★★ 调用v1.8模块的重置函数
+      ResetPositionRecord();
    }
    if(g_emergencyAtrHandle != INVALID_HANDLE) IndicatorRelease(g_emergencyAtrHandle);
    if(g_Logger != NULL) g_Logger.WriteInfo("EA 停止，清理模块");
 }
 
-//=========================== OnTick (已修改) =================================
+//=========================== OnTick =================================
 void OnTick()
 {
-   // --- 持仓管理 ---
    if(PositionSelect(_Symbol)) 
    {
       ManagePosition();
    }
-   // --- 无持仓时的逻辑 ---
    else
    {
-      // ★★★ 如果之前有仓位，现在没了，就重置记录器 ★★★
-      ResetPositionRecord(); 
-      
-      if(!CanOpenNewTrade(EnableDebug)) return;
+      if(BaseExitStrategy == EXIT_MODE_STRUCTURAL) ResetPositionRecord(); 
+      if(!CanOpenNewTrade(g_riskInputs, EnableDebug)) return;
       if(g_lastOpenTime > 0 && TimeCurrent() - g_lastOpenTime < Entry_CooldownSeconds) return;
       double sl_price = 0;
       ENUM_ORDER_TYPE sig = GetEntrySignal(sl_price);
@@ -241,7 +265,7 @@ void OnTick()
    }
 }
 
-//=========================== 开仓接口 (已修改) ================================
+//=========================== 开仓接口 ================================
 void OpenPosition(ENUM_ORDER_TYPE type, double sl)
 {
    bool ok = OpenMarketOrder_Fixed(type, sl, 0, "ST-EA v5.6.3");
@@ -249,8 +273,6 @@ void OpenPosition(ENUM_ORDER_TYPE type, double sl)
    {
       g_initialSL = sl; g_step1Done = false; g_step2Done = false;
       g_lastOpenTime = TimeCurrent(); g_lastTrendHigh = 0.0; g_lastTrendLow = 0.0;
-      
-      // ★★★ 核心修改：开仓成功后，立即调用v1.8模块的记录函数 ★★★
       if(BaseExitStrategy == EXIT_MODE_STRUCTURAL && PositionSelect(_Symbol))
       {
          ulong ticket = PositionGetTicket(0);
@@ -260,7 +282,7 @@ void OpenPosition(ENUM_ORDER_TYPE type, double sl)
    }
 }
 
-//======================== 持仓管理函数 (已修改) ======================
+//======================== 持仓管理函数 ======================
 void ManagePosition()
 {
    static datetime last_bar_time = 0;
@@ -273,7 +295,6 @@ void ManagePosition()
       last_bar_time = current_bar_time;
    }
    
-   // ★★★ 核心修改：使用正确的函数名和参数调用v1.8模块 ★★★
    if(BaseExitStrategy == EXIT_MODE_STRUCTURAL) 
    {
       if(PositionSelect(_Symbol))
@@ -294,8 +315,7 @@ void ManagePosition()
          if(pct >= 100.0) 
          {
             g_trade.PositionClose(_Symbol);
-            // 平仓后也重置一下记录器
-            ResetPositionRecord(); 
+            if(BaseExitStrategy == EXIT_MODE_STRUCTURAL) ResetPositionRecord(); 
          }
          else
          {
