@@ -1,9 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                   Risk_Management_Module.mqh     |
-//|     核心风控与资金管理模块  v2.4  (终极修复版)                   |
+//|     核心风控与资金管理模块  v2.5  (终极修复版)                   |
+//|  • 修复: 移除EnableDebug的extern声明，通过函数参数传递。         |
 //|  • 修复: 重构CalculateFinalStopLoss，使其只做合规审查。          |
 //|  • 新增: 添加IsStopLossValid函数，用于统一的止损合法性检查。     |
-//|  • 继承 v2.3 所有功能。                                         |
+//|  • 继承 v2.4 所有功能。                                         |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade\Trade.mqh>
@@ -40,9 +41,6 @@ static bool     rm_dayLossLimitHit   = false;
 static int      rm_atrHandle         = INVALID_HANDLE;
 extern CLogModule* g_Logger;
 
-extern bool ST_Debug;
-
-
 //==================================================================
 //  初始化和清理函数
 //==================================================================
@@ -54,7 +52,7 @@ void InitRiskModule()
 
    rm_atrHandle = iATR(_Symbol, _Period, Risk_atrPeriod);
    if(rm_atrHandle == INVALID_HANDLE) Print("[风控] ATR 初始化失败");
-   else Print("[风控] 风控模块 v2.4 初始化完成 (终极修复版)");
+   else Print("[风控] 风控模块 v2.5 初始化完成 (终极修复版)");
 }
 
 void DeinitRiskModule()
@@ -113,7 +111,7 @@ double NormalizePrice(double price)
 }
 
 // ★★★ 函数已重构，逻辑更清晰严谨 ★★★
-double CalculateFinalStopLoss(double actualOpenPrice, double originalSL, ENUM_ORDER_TYPE orderType)
+double CalculateFinalStopLoss(double actualOpenPrice, double originalSL, ENUM_ORDER_TYPE orderType, bool enableDebug = false)
 {
    if (!MathIsValidNumber(actualOpenPrice) || !MathIsValidNumber(originalSL)) return 0.0;
    
@@ -126,7 +124,7 @@ double CalculateFinalStopLoss(double actualOpenPrice, double originalSL, ENUM_OR
       if(finalSL > requiredMinSL) 
       {
          finalSL = requiredMinSL;
-         if(g_Logger != NULL && ST_Debug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离，强制拓宽至 %.5f", originalSL, finalSL));
+         if(g_Logger != NULL && enableDebug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离，强制拓宽至 %.5f", originalSL, finalSL));
       }
    }
    else
@@ -135,7 +133,7 @@ double CalculateFinalStopLoss(double actualOpenPrice, double originalSL, ENUM_OR
       if(finalSL < requiredMinSL)
       {
          finalSL = requiredMinSL;
-         if(g_Logger != NULL && ST_Debug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离，强制拓宽至 %.5f", originalSL, finalSL));
+         if(g_Logger != NULL && enableDebug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离，强制拓宽至 %.5f", originalSL, finalSL));
       }
    }
    
@@ -167,16 +165,16 @@ bool IsStopLossValid(double sl, ENUM_POSITION_TYPE posType)
    return true;
 }
 
-bool SetStopLossWithRetry(CTrade &t, double stopLoss, double takeProfit, int maxRetries = 3)
+bool SetStopLossWithRetry(CTrade &t, double stopLoss, double takeProfit, int maxRetries = 3, bool enableDebug = false)
 {
    for(int i = 0; i < maxRetries; ++i)
    {
       if(t.PositionModify(_Symbol, stopLoss, takeProfit))
       {
-         if(g_Logger && ST_Debug) Print("[风控] 止损设置成功 (第", i+1, "次)");
+         if(g_Logger && enableDebug) Print("[风控] 止损设置成功 (第", i+1, "次)");
          return true;
       }
-      if(g_Logger && ST_Debug) Print("[风控] 止损设置失败 (第", i+1, "次) err=", GetLastError());
+      if(g_Logger && enableDebug) Print("[风控] 止损设置失败 (第", i+1, "次) err=", GetLastError());
       if(i < maxRetries - 1) Sleep(200);
    }
    return false;
@@ -197,6 +195,7 @@ double GetMinStopDistance()
    double brokerMin = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
    return MathMax(dist, brokerMin);
 }
+
 double GetMaxAllowedLotSize()
 {
    if(!Risk_enableLotLimit) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
@@ -204,7 +203,8 @@ double GetMaxAllowedLotSize()
    double byBalance = (Risk_maxLotByBalance > 0) ? (balance / Risk_maxLotByBalance) : SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    return MathMin(byBalance, Risk_maxAbsoluteLot);
 }
-bool CanOpenNewTrade(bool dbg=false)
+
+bool CanOpenNewTrade(bool enableDebug = false)
 {
    if(!Risk_AllowNewTrade) return false;
    datetime now = TimeCurrent();
@@ -222,7 +222,7 @@ bool CanOpenNewTrade(bool dbg=false)
    if(loss > 0 && limitVal > 0 && loss >= limitVal)
    {
       rm_dayLossLimitHit = true;
-      if(g_Logger && dbg) g_Logger.WriteError(StringFormat("当日亏损 %.2f >= 限额 %.2f. 停止新交易。", loss, limitVal));
+      if(g_Logger && enableDebug) g_Logger.WriteError(StringFormat("当日亏损 %.2f >= 限额 %.2f. 停止新交易。", loss, limitVal));
       return false;
    }
    return true;

@@ -1,8 +1,8 @@
 //+------------------------------------------------------------------+
 //| SuperTrend EA – v4.0(终极修复版)                              |
 //| © 2025                                                           |
-//| • 异步止损: 重构开仓逻辑，先“裸单开仓”确保入场，再异步设置止损。 |
-//| • 决策升级: 止损计算采用“三级防御体系”，确保选择最远的止损。     |
+//| • 异步止损: 重构开仓逻辑，先"裸单开仓"确保入场，再异步设置止损。 |
+//| • 决策升级: 止损计算采用"三级防御体系"，确保选择最远的止损。     |
 //| • 修复: 移除了主文件中重复定义的NormalizePrice等函数。           |
 //| • 继承 v4.0 所有功能，包括二次进场、结构化止损等。               |
 //+------------------------------------------------------------------+
@@ -25,9 +25,7 @@ CTrade      g_trade;
 
 //----------------- Core Settings ------------------------------------
 input group "--- Core Settings ---"
-
-input bool ST_Debug = true;
-
+input bool   EnableDebug             = true;
 input int    EmergencyATRPeriod      = 14;
 input double EmergencyATRMultiplier  = 1.5;
 input int    Entry_CooldownSeconds   = 0;
@@ -85,11 +83,11 @@ bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType,
    double lot = CalculateLotSize(originalSL, orderType);
    if(lot <= 0.0)
    {
-      if(g_Logger && ST_Debug) g_Logger.WriteWarning("风控后手数=0，跳过交易");
+      if(g_Logger && EnableDebug) g_Logger.WriteWarning("风控后手数=0，跳过交易");
       return false;
    }
 
-   // --- 步骤 2: 执行“裸单开仓”，不带止损 ---
+   // --- 步骤 2: 执行"裸单开仓"，不带止损 ---
    double estPrice = (orderType == ORDER_TYPE_BUY) ? MarketAsk() : MarketBid();
    g_trade.SetDeviationInPoints((int)Risk_slippage);
    if(!g_trade.PositionOpen(_Symbol, orderType, lot, estPrice, 0, 0, comment))
@@ -118,21 +116,21 @@ bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType,
    if (IsStopLossValid(normalized_originalSL, posType))
    {
       valid_sl_candidates.Add(normalized_originalSL);
-      if(g_Logger != NULL && ST_Debug) g_Logger.WriteInfo(StringFormat("SL候选 (原始趋势线): %.5f", normalized_originalSL));
+      if(g_Logger != NULL && EnableDebug) g_Logger.WriteInfo(StringFormat("SL候选 (原始趋势线): %.5f", normalized_originalSL));
    }
    // 候选人B: 最小距离保障止损
-   double baseFinalSL = CalculateFinalStopLoss(openP, originalSL, orderType);
+   double baseFinalSL = CalculateFinalStopLoss(openP, originalSL, orderType, EnableDebug);
    if (IsStopLossValid(baseFinalSL, posType) && valid_sl_candidates.Search(baseFinalSL) < 0)
    {
       valid_sl_candidates.Add(baseFinalSL);
-      if(g_Logger != NULL && ST_Debug) g_Logger.WriteInfo(StringFormat("SL候选 (最小距离保障): %.5f", baseFinalSL));
+      if(g_Logger != NULL && EnableDebug) g_Logger.WriteInfo(StringFormat("SL候选 (最小距离保障): %.5f", baseFinalSL));
    }
    // 候选人C: 紧急ATR止损
    double emergencySL = GetSaferEmergencyStopLoss(openP, originalSL, orderType);
    if (IsStopLossValid(emergencySL, posType) && valid_sl_candidates.Search(emergencySL) < 0)
    {
       valid_sl_candidates.Add(emergencySL);
-      if(g_Logger != NULL && ST_Debug) g_Logger.WriteInfo(StringFormat("SL候选 (紧急ATR): %.5f", emergencySL));
+      if(g_Logger != NULL && EnableDebug) g_Logger.WriteInfo(StringFormat("SL候选 (紧急ATR): %.5f", emergencySL));
    }
 
    // 3.2: 从中选择最远的那个
@@ -144,7 +142,7 @@ bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType,
       {
          finalSL = (orderType == ORDER_TYPE_BUY) ? MathMin(finalSL, valid_sl_candidates.At(i)) : MathMax(finalSL, valid_sl_candidates.At(i));
       }
-      if(g_Logger != NULL && ST_Debug) g_Logger.WriteInfo(StringFormat("决策完成: 从 %d 个合法候选中选择了最远的SL: %.5f", valid_sl_candidates.Total(), finalSL));
+      if(g_Logger != NULL && EnableDebug) g_Logger.WriteInfo(StringFormat("决策完成: 从 %d 个合法候选中选择了最远的SL: %.5f", valid_sl_candidates.Total(), finalSL));
    }
    else
    {
@@ -155,7 +153,7 @@ bool OpenMarketOrder_Fixed(ENUM_ORDER_TYPE orderType,
    // 3.3: 异步设置最终止损
    if(finalSL != 0 && MathIsValidNumber(finalSL))
    {
-      if(!SetStopLossWithRetry(g_trade, finalSL, tpPrice, 3))
+      if(!SetStopLossWithRetry(g_trade, finalSL, tpPrice, 3, EnableDebug))
       {
          if(g_Logger) g_Logger.WriteError("🚨 警告：异步设置止损失败，仓位暂时无止损保护！EA将在下一Tick重试。");
       }
@@ -231,26 +229,26 @@ void OnTick()
       ulong ticket = PositionGetInteger(POSITION_TICKET);
       if(PositionGetDouble(POSITION_SL) == 0)
       {
-          if(g_Logger && ST_Debug) g_Logger.WriteWarning("检测到无SL的持仓，将由管理逻辑处理...");
+          if(g_Logger && EnableDebug) g_Logger.WriteWarning("检测到无SL的持仓，将由管理逻辑处理...");
       }
       ProcessStructuralExit(g_structExitConfig, ticket);
       ManagePosition();
    }
    else
    {
-      if(!CanOpenNewTrade(ST_Debug)) return;
+      if(!CanOpenNewTrade(EnableDebug)) return;
       if(g_lastOpenTime > 0 && TimeCurrent() - g_lastOpenTime < Entry_CooldownSeconds) return;
       double sl_price = 0;
       ENUM_ORDER_TYPE sig = GetEntrySignal(sl_price);
       if(sig == ORDER_TYPE_NONE) return;
       if(sig == ORDER_TYPE_BUY && g_lastTrendHigh > 0 && MarketAsk() <= g_lastTrendHigh)
       {
-         if(g_Logger && ST_Debug) g_Logger.WriteInfo(StringFormat("二次做多过滤: 等待突破 %.5f", g_lastTrendHigh));
+         if(g_Logger && EnableDebug) g_Logger.WriteInfo(StringFormat("二次做多过滤: 等待突破 %.5f", g_lastTrendHigh));
          return;
       }
       else if(sig == ORDER_TYPE_SELL && g_lastTrendLow > 0 && MarketBid() >= g_lastTrendLow)
       {
-         if(g_Logger && ST_Debug) g_Logger.WriteInfo(StringFormat("二次做空过滤: 等待跌破 %.5f", g_lastTrendLow));
+         if(g_Logger && EnableDebug) g_Logger.WriteInfo(StringFormat("二次做空过滤: 等待跌破 %.5f", g_lastTrendLow));
          return;
       }
       if(g_emergencyAtrHandle != INVALID_HANDLE)
