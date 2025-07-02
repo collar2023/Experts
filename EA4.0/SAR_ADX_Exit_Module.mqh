@@ -1,8 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                     SAR_ADX_Exit_Module.mqh       |
-//|        SAR+ADX联合出场 与 RRR分步止盈 整合出场模块             |
-//|               (新增空头出场逻辑, 成为完整版)                   |
-//|               (新增1.5R生效前提条件)                          |
+//|        SAR+ADX联合出场 与 RRR分步止盈 整合出场模块 v2.0         |
+//|          (核心升级: SAR反转信号基于K线收盘确认)                |
 //+------------------------------------------------------------------+
 
 #property strict
@@ -28,6 +27,9 @@ input double   Step1Pct         = 40.0;     // TP1 平仓百分比
 input double   Step2Pct         = 30.0;     // TP2 平仓百分比
 input double   Step2Factor      = 1.5;      // TP2 触发因子 (实际RRR = RRratio * Step2Factor)
 
+input group    "--- Emergency SL Adaptation ---"
+// 注意：紧急止损是安全保护机制，与交易逻辑的R倍数计算分离
+
 //==================================================================
 //  全局变量与枚举
 //==================================================================
@@ -39,7 +41,7 @@ int atr_handle_exit = INVALID_HANDLE;
 enum EXIT_REASON { NO_EXIT, EXIT_LONG, EXIT_SHORT };
 
 //==================================================================
-//  模块核心功能函数
+//  模块初始化与清理函数 (保持不变)
 //==================================================================
 
 bool InitExitModule(const string symbol, const ENUM_TIMEFRAMES period)
@@ -65,7 +67,7 @@ bool InitExitModule(const string symbol, const ENUM_TIMEFRAMES period)
       return false;
    }
    
-   Print("SAR+ADX+StepTP 统一出场模块初始化成功 (含1.5R条件)");
+   Print("SAR+ADX+StepTP 统一出场模块 v2.0 初始化成功 (SAR收盘确认)");
    return true;
 }
 
@@ -76,116 +78,172 @@ void DeinitExitModule()
    if(atr_handle_exit != INVALID_HANDLE) IndicatorRelease(atr_handle_exit);
 }
 
-// 计算当前盈利的R倍数 (基于风险单位，非RRR概念)
-double CalculateCurrentRMultiple(const double openPrice, const double initialSL, ENUM_POSITION_TYPE posType)
+//==================================================================
+//  辅助计算函数 (保持不变)
+//==================================================================
+
+// 计算交易逻辑的R倍数风险单位 (与止损保护系统分离)
+double CalculateRiskUnit(const double openPrice, const double originalSL, ENUM_POSITION_TYPE posType)
 {
-   if(openPrice <= 0) return 0.0;
-   
    double riskPoints = 0.0;
    
-   // 优先使用SL计算风险单位R
-   if(initialSL > 0)
+   if(originalSL > 0)
    {
-      if(posType == POSITION_TYPE_BUY)
-         riskPoints = (openPrice - initialSL) / _Point;
-      else
-         riskPoints = (initialSL - openPrice) / _Point;
+      riskPoints = (posType == POSITION_TYPE_BUY) ? (openPrice - originalSL) : (originalSL - openPrice);
+      riskPoints /= _Point;
    }
    
-   // SL无效时使用ATR作为风险单位
    if(riskPoints <= 0)
    {
       double atr[1];
-      if(CopyBuffer(atr_handle_exit, 0, 1, 1, atr) < 1) return 0.0;
-      riskPoints = atr[0] / _Point;
+      if(CopyBuffer(atr_handle_exit, 0, 1, 1, atr) >= 1 && atr[0] > 0)
+      {
+         riskPoints = atr[0] / _Point;
+      }
    }
    
+   return riskPoints;
+}
+
+// 计算当前盈利的R倍数
+double CalculateCurrentRMultiple(const double openPrice, const double originalSL, ENUM_POSITION_TYPE posType)
+{
+   if(openPrice <= 0) return 0.0;
+   
+   double riskPoints = CalculateRiskUnit(openPrice, originalSL, posType);
    if(riskPoints <= 0) return 0.0;
    
-   // 计算当前盈利点数
    double currentPrice = (posType == POSITION_TYPE_BUY) 
                         ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
                         : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    
-   double profitPoints = 0.0;
-   if(posType == POSITION_TYPE_BUY)
-      profitPoints = (currentPrice - openPrice) / _Point;
-   else
-      profitPoints = (openPrice - currentPrice) / _Point;
+   double profitPoints = (posType == POSITION_TYPE_BUY)
+                        ? (currentPrice - openPrice) / _Point
+                        : (openPrice - currentPrice) / _Point;
    
-   // 返回盈利相对于风险单位的倍数 (这是纯粹的R倍数，不是RRR)
    return profitPoints / riskPoints;
 }
 
-// 内部逻辑：获取反转信号 (带1.5R条件检查)
-EXIT_REASON GetReversalSignal(const double openPrice, const double initialSL, ENUM_POSITION_TYPE posType)
+//==================================================================
+//  模块核心逻辑 (核心修改区域)
+//==================================================================
+
+//+------------------------------------------------------------------+
+//| 内部逻辑：获取反转信号 (v2.0 - K线收盘确认版)                     |
+//+------------------------------------------------------------------+
+EXIT_REASON GetReversalSignal(const double openPrice, const double originalSL, ENUM_POSITION_TYPE posType)
 {
-   double sar[2];
-   if(CopyBuffer(sar_handle_exit, 0, 0, 2, sar) < 2) return NO_EXIT;
+    // 1. 获取稳定的历史数据
+    double sar[3];
+    if(CopyBuffer(sar_handle_exit, 0, 0, 3, sar) < 3) return NO_EXIT;
 
-   double high_prev = iHigh(_Symbol, _Period, 1);
-   double low_prev = iLow(_Symbol, _Period, 1);
-   double high_curr = iHigh(_Symbol, _Period, 0);
-   double low_curr = iLow(_Symbol, _Period, 0);
+    // 2. 【核心修改】基于已收盘的K线[1]和[2]判断趋势方向
+    // 趋势定义：如果K线的最低价高于其SAR点，视为上升趋势；反之亦然。
+    bool trend_is_up_on_bar1 = iLow(_Symbol, _Period, 1) > sar[1];
+    bool trend_is_up_on_bar2 = iLow(_Symbol, _Period, 2) > sar[2];
 
-   bool sarReversedToDown = (high_prev > sar[1] && low_curr < sar[0]);
-   bool sarReversedToUp = (low_prev < sar[1] && high_curr > sar[0]);
+    // 3. 检测趋势是否在上一根K线[1]发生反转
+    if(trend_is_up_on_bar1 == trend_is_up_on_bar2)
+    {
+        return NO_EXIT; // 趋势未反转
+    }
+    
+    // 【新增】防重复平仓机制
+    static datetime last_reversal_time = 0;
+    datetime signal_bar_time = (datetime)iTime(_Symbol, _Period, 1);
+    if(signal_bar_time <= last_reversal_time)
+    {
+        return NO_EXIT;
+    }
 
-   if(!sarReversedToDown && !sarReversedToUp) return NO_EXIT;
-   
-   EXIT_REASON reason = sarReversedToDown ? EXIT_LONG : EXIT_SHORT;
-   
-   // 检查是否达到1.5R条件 (这里的R是风险单位，不是RRR)
-   double currentRMultiple = CalculateCurrentRMultiple(openPrice, initialSL, posType);
-   if(currentRMultiple < SAR_MinRRatio) return NO_EXIT;
+    // 确定反转方向
+    EXIT_REASON reason = trend_is_up_on_bar1 ? EXIT_SHORT : EXIT_LONG; // 注意：趋势向上反转，是平空头仓(EXIT_SHORT)；反之平多头(EXIT_LONG)
 
-   if(UseADXFilter)
-   {
-      double adx[2], plus[2], minus[2];
-      if(CopyBuffer(adx_handle_exit, MAIN_LINE, 0, 2, adx) < 2 ||
-         CopyBuffer(adx_handle_exit, PLUSDI_LINE, 0, 2, plus) < 2 ||
-         CopyBuffer(adx_handle_exit, MINUSDI_LINE, 0, 2, minus) < 2) 
-         return NO_EXIT;
+    // 4. 检查R倍数盈利条件 (逻辑不变，依然重要)
+    double currentRMultiple = CalculateCurrentRMultiple(openPrice, originalSL, posType);
+    if(currentRMultiple < SAR_MinRRatio)
+    {
+       // 虽然有信号，但盈利未达标，不平仓
+       return NO_EXIT;
+    }
 
-      bool isStrong = adx[0] > ADX_MinLevel;
-      bool isWeakening = adx[0] < adx[1];
-      
-      if(reason == EXIT_LONG && isStrong && (isWeakening || (minus[0] > plus[0] && minus[1] <= plus[1]))) return EXIT_LONG;
-      if(reason == EXIT_SHORT && isStrong && (isWeakening || (plus[0] > minus[0] && plus[1] <= minus[1]))) return EXIT_SHORT;
-      
-      return NO_EXIT;
-   }
-   
-   return reason;
+    // 5. ADX过滤器 (如果启用)
+    if(UseADXFilter)
+    {
+        double adx[2], plus[2], minus[2];
+        if(CopyBuffer(adx_handle_exit,  MAIN_LINE , 0, 2, adx)   < 2 ||
+          CopyBuffer(adx_handle_exit,  PLUSDI_LINE, 0, 2, plus) < 2 ||
+          CopyBuffer(adx_handle_exit,  MINUSDI_LINE, 0, 2, minus)< 2)
+        {
+          return NO_EXIT;
+        }
+
+        bool isStrong = adx[1] > ADX_MinLevel;      // 在信号K线[1]上趋势是否强劲
+        bool isWeakening = adx[1] < adx[0];       // 趋势从K线[0]到K线[1]是否在减弱 (adx[0]是更早的数据)
+        
+        // 逻辑简化和加强：当趋势减弱(isWeakening)或DI线发生死叉/金叉时，确认信号
+        bool di_cross_confirms_exit_long = (minus[1] > plus[1]); // -DI上穿+DI，确认多头离场
+        bool di_cross_confirms_exit_short = (plus[1] > minus[1]); // +DI上穿-DI，确认空头离场
+        
+        // 多头离场确认 (EXIT_LONG)
+        if(reason == EXIT_LONG && posType == POSITION_TYPE_BUY)
+        {
+           if(isStrong && (isWeakening || di_cross_confirms_exit_long))
+           {
+              // 条件满足，可以离场
+           }
+           else
+           {
+              return NO_EXIT; // ADX未确认
+           }
+        }
+        
+        // 空头离场确认 (EXIT_SHORT)
+        if(reason == EXIT_SHORT && posType == POSITION_TYPE_SELL)
+        {
+           if(isStrong && (isWeakening || di_cross_confirms_exit_short))
+           {
+               // 条件满足，可以离场
+           }
+           else
+           {
+              return NO_EXIT; // ADX未确认
+           }
+        }
+    }
+    
+    last_reversal_time = signal_bar_time; // 记录已处理的信号K线
+    return reason;
 }
 
-// 主函数：获取多头出场指令 (返回平仓百分比)
-double GetLongExitAction(const double openPrice, const double initialSL, bool &step1Done, bool &step2Done)
+//+------------------------------------------------------------------+
+//| 主函数：获取多头出场指令 (调用新版反转检测)                       |
+//+------------------------------------------------------------------+
+double GetLongExitAction(const double openPrice, const double originalSL, bool &step1Done, bool &step2Done)
 {
-   // 1. SAR反转信号触发，直接全平 (需达到1.5R条件)
-   if(UseSARReversal && GetReversalSignal(openPrice, initialSL, POSITION_TYPE_BUY) == EXIT_LONG)
+   // 1. SAR反转信号触发，直接全平
+   if(UseSARReversal && GetReversalSignal(openPrice, originalSL, POSITION_TYPE_BUY) == EXIT_LONG)
+   {
+      Print("SAR反转信号(收盘确认): 触发多头平仓.");
       return 100.0;
+   }
 
-   // 2. 分步止盈逻辑
+   // 2. 分步止盈逻辑 (逻辑不变)
    if(EnableStepTP)
    {
-      if(openPrice <= 0 || initialSL <= 0 || RRratio <= 0)
-         return 0.0;
+      if(openPrice <= 0 || RRratio <= 0) return 0.0;
 
-      double riskPts = (openPrice - initialSL) / _Point;
-      if(riskPts <= 0)
-         return 0.0;
+      double riskPts = CalculateRiskUnit(openPrice, originalSL, POSITION_TYPE_BUY);
+      if(riskPts <= 0) return 0.0;
 
       double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double profitPts = (currentPrice - openPrice) / _Point;
 
-      // TP2优先判断
       if(!step2Done && Step2Pct > 0 && profitPts >= riskPts * RRratio * Step2Factor) 
       {
          step2Done = true;
          return Step2Pct;
       }
-      // TP1判断
       if(!step1Done && Step1Pct > 0 && profitPts >= riskPts * RRratio) 
       {
          step1Done = true;
@@ -195,33 +253,34 @@ double GetLongExitAction(const double openPrice, const double initialSL, bool &s
    return 0.0;
 }
 
-// 主函数：获取空头出场指令 (返回平仓百分比)
-double GetShortExitAction(const double openPrice, const double initialSL, bool &step1Done, bool &step2Done)
+//+------------------------------------------------------------------+
+//| 主函数：获取空头出场指令 (调用新版反转检测)                       |
+//+------------------------------------------------------------------+
+double GetShortExitAction(const double openPrice, const double originalSL, bool &step1Done, bool &step2Done)
 {
-   // 1. SAR反转信号触发，直接全平 (需达到1.5R条件)
-   if(UseSARReversal && GetReversalSignal(openPrice, initialSL, POSITION_TYPE_SELL) == EXIT_SHORT)
+   // 1. SAR反转信号触发，直接全平
+   if(UseSARReversal && GetReversalSignal(openPrice, originalSL, POSITION_TYPE_SELL) == EXIT_SHORT)
+   {
+      Print("SAR反转信号(收盘确认): 触发空头平仓.");
       return 100.0;
+   }
 
-   // 2. 分步止盈逻辑
+   // 2. 分步止盈逻辑 (逻辑不变)
    if(EnableStepTP)
    {
-      if(openPrice <= 0 || initialSL <= 0 || RRratio <= 0)
-         return 0.0;
+      if(openPrice <= 0 || RRratio <= 0) return 0.0;
 
-      double riskPts = (initialSL - openPrice) / _Point;
-      if(riskPts <= 0)
-         return 0.0;
+      double riskPts = CalculateRiskUnit(openPrice, originalSL, POSITION_TYPE_SELL);
+      if(riskPts <= 0) return 0.0;
 
       double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double profitPts = (openPrice - currentPrice) / _Point;
 
-      // TP2优先判断
       if(!step2Done && Step2Pct > 0 && profitPts >= riskPts * RRratio * Step2Factor) 
       {
          step2Done = true;
          return Step2Pct;
       }
-      // TP1判断
       if(!step1Done && Step1Pct > 0 && profitPts >= riskPts * RRratio) 
       {
          step1Done = true;

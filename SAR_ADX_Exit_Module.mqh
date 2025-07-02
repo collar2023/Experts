@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                     SAR_ADX_Exit_Module.mqh       |
-//|        动态R倍数 + SAR/ADX 协同出场模块 v3.0 (2025-07-07)         |
+//|        动态R倍数 + SAR/ADX 协同出场模块 v3.0 (2025-07-01)         |
 //|  • 核心升级: 引入“动态R倍数”止盈，由ADX值协同调整止盈目标。      |
 //|  • 增强盈利: 强趋势时放大盈利目标，弱趋势时提前锁定利润。        |
 //|  • 继承修复: 完整保留v2.1版本对ATR后备计算的所有安全修复。       |
@@ -13,14 +13,14 @@
 //==================================================================
 
 input group    "--- Reversal Exit Settings (SAR & ADX) ---"
-input bool     UseSARReversal   = true;     // [开关] 是否使用SAR反转信号平全仓
+input bool     UseSARReversal   = false;     // [开关] 是否使用SAR反转信号平全仓
 input bool     UseADXFilter     = true;     // [开关] SAR信号是否需要ADX确认
 input double   SAR_Step         = 0.02;     // SAR 步长
 input double   SAR_Maximum      = 0.2;      // SAR 最大值
-input int      ADX_Period       = 14;       // ADX 周期
+input int      ADX_Period       = 10;       // ADX 周期
 input double   ADX_MinLevel     = 25.0;     // ADX 最小阈值 (用于确认趋势)
 input double   SAR_MinRRatio    = 1.5;      // SAR信号生效的最小R倍数
-input int      ATR_Period       = 14;       // ATR周期 (当SL失效时使用)
+input int      ATR_Period       = 10;       // ATR周期 (当SL失效时使用)
 
 input group    "--- Step Take Profit Settings (RRR) ---"
 input bool     EnableStepTP     = true;     // [开关] 是否启用分步止盈

@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//| Risk_Management_Module.mqh – 核心风控与资金管理 v2.6 (2025‑07‑04)|
-//| ★ v2.6: 终极修复版 - 全面部署 MathIsValidNumber() 防护          |
-//|   1) 所有价格计算函数入口和出口均增加有效性检查。                |
-//|   2) NormalizePrice() 增加对无效数字的输入检查。               |
-//|   3) 彻底杜绝因计算过程产生的 inf/nan 导致止损设置失败。       |
+//| Risk_Management_Module.mqh – 核心风控与资金管理 v2.6.1 (修复版)|
+//| ★ v2.6.1: 修复了CalculateFinalStopLoss的决策逻辑，使其只做合规审查 |
+//|   1) 该函数现在只在原始SL不满足最小距离时才强制拉大止损。        |
+//|   2) 确保了该函数不会错误地提出一个过窄的止损方案。              |
+//|   3) 其余逻辑继承 v2.6 的 MathIsValidNumber() 防护。           |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -38,6 +38,7 @@ static int      rm_currentDay        = -1;
 static double   rm_dayStartBalance   = 0.0;
 static bool     rm_dayLossLimitHit   = false;
 static int      rm_atrHandle         = INVALID_HANDLE;
+extern CLogModule* g_Logger; // 假设主文件有g_Logger定义
 
 //==================================================================
 //  初始化和清理函数 (无修改)
@@ -52,7 +53,7 @@ void InitRiskModule()
    if(rm_atrHandle == INVALID_HANDLE)
       Print("[风控] ATR 初始化失败");
    else
-      Print("[风控] 风控模块 v2.6 初始化完成 (MathIsValidNumber 终极保护)");
+      Print("[风控] 风控模块 v2.6.1 初始化完成 (决策逻辑修复)");
 }
 
 void DeinitRiskModule()
@@ -72,14 +73,14 @@ void ConfigureTrader(CTrade &t)
 //==================================================================
 double CalculateLotSize(double original_sl_price, ENUM_ORDER_TYPE type)
 {
-   if(!MathIsValidNumber(original_sl_price)) return 0.0; // ★ 防护
+   if(!MathIsValidNumber(original_sl_price)) return 0.0;
    double estPrice = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(estPrice <= 0) return 0.0;
    double buffer = Risk_slippage * _Point;
    if(type == ORDER_TYPE_BUY)  estPrice += buffer;
    else                        estPrice -= buffer;
    double riskPoints = MathAbs(estPrice - original_sl_price);
-   if(riskPoints <= 0 || !MathIsValidNumber(riskPoints)) return 0.0; // ★ 防护
+   if(riskPoints <= 0 || !MathIsValidNumber(riskPoints)) return 0.0;
    double lot = 0.0;
    if(Risk_useFixedLot) lot = Risk_fixedLot;
    else
@@ -91,7 +92,7 @@ double CalculateLotSize(double original_sl_price, ENUM_ORDER_TYPE type)
       double riskAmt = balance * Risk_riskPercent / 100.0;
       lot = riskAmt / (riskPoints / _Point * tickValue);
    }
-   if(!MathIsValidNumber(lot)) return 0.0; // ★ 防护
+   if(!MathIsValidNumber(lot)) return 0.0;
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    lot = MathMin(lot, GetMaxAllowedLotSize());
@@ -105,7 +106,6 @@ double CalculateLotSize(double original_sl_price, ENUM_ORDER_TYPE type)
 //==================================================================
 double NormalizePrice(double price)
 {
-   // ★★★ 终极入口设防 ★★★
    if (!MathIsValidNumber(price)) return 0.0;
    
    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -114,32 +114,47 @@ double NormalizePrice(double price)
    return NormalizeDouble(MathRound(price / tickSize) * tickSize, _Digits);
 }
 
+// ★★★ 函数已重构，逻辑更清晰严谨 ★★★
 double CalculateFinalStopLoss(double actualOpenPrice, double originalSL, ENUM_ORDER_TYPE orderType)
 {
-   // ★★★ 源头设防 ★★★
+   // --- 入口防护 ---
    if (!MathIsValidNumber(actualOpenPrice) || !MathIsValidNumber(originalSL)) return 0.0;
    
-   double minDist = GetMinStopDistance();
-   double sl = originalSL;
+   double minDist = GetMinStopDistance(); // 获取最低合规距离
+   double finalSL = originalSL;          // ★ 关键: 默认我们接受策略提出的理想止损
+
+   // --- 进行合规审查 ---
    if(orderType == ORDER_TYPE_BUY)
    {
-      double minSL = actualOpenPrice - minDist;
-      if(originalSL > minSL) sl = minSL;
+      double requiredMinSL = actualOpenPrice - minDist; // 计算出最低合规的止损价格
+      // ★ 核心逻辑: 只有当我们的理想止损(finalSL)不够宽时，才强制使用最低合规位
+      // 对于多单，止损价越小，距离越远。所以 finalSL > requiredMinSL 意味着它比最低要求还窄。
+      if(finalSL > requiredMinSL) 
+      {
+         finalSL = requiredMinSL; // 强制使用更宽的、符合最低要求的止损
+         if(g_Logger != NULL && EnableDebug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离要求，强制拓宽至 %.5f", originalSL, finalSL));
+      }
    }
-   else
+   else // SELL
    {
-      double minSL = actualOpenPrice + minDist;
-      if(originalSL < minSL) sl = minSL;
+      double requiredMinSL = actualOpenPrice + minDist; // 计算出最低合规的止损价格
+      // ★ 核心逻辑: 只有当我们的理想止损(finalSL)不够宽时，才强制使用最低合规位
+      // 对于空单，止损价越大，距离越远。所以 finalSL < requiredMinSL 意味着它比最低要求还窄。
+      if(finalSL < requiredMinSL)
+      {
+         finalSL = requiredMinSL; // 强制使用更宽的、符合最低要求的止损
+         if(g_Logger != NULL && EnableDebug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离要求，强制拓宽至 %.5f", originalSL, finalSL));
+      }
    }
    
-   // ★★★ 出口设防 ★★★
-   if (!MathIsValidNumber(sl)) return 0.0;
-   return sl;
+   // --- 出口防护与标准化 ---
+   if (!MathIsValidNumber(finalSL)) return 0.0;
+   return NormalizePrice(finalSL);
 }
 
 bool IsStopLossValid(double sl, ENUM_POSITION_TYPE posType)
 {
-   if (!MathIsValidNumber(sl) || sl == 0) return false; // ★ 防护
+   if (!MathIsValidNumber(sl) || sl == 0) return false;
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double pt  = _Point;
