@@ -6,6 +6,7 @@
 //|   3) 其余逻辑继承 v2.6 的 MathIsValidNumber() 防护。           |
 //+------------------------------------------------------------------+
 #property strict
+
 #include <Trade/Trade.mqh>
 
 //==================================================================
@@ -38,6 +39,7 @@ static int      rm_currentDay        = -1;
 static double   rm_dayStartBalance   = 0.0;
 static bool     rm_dayLossLimitHit   = false;
 static int      rm_atrHandle         = INVALID_HANDLE;
+extern bool ST_Debug;
 extern CLogModule* g_Logger; // 假设主文件有g_Logger定义
 
 //==================================================================
@@ -132,7 +134,7 @@ double CalculateFinalStopLoss(double actualOpenPrice, double originalSL, ENUM_OR
       if(finalSL > requiredMinSL) 
       {
          finalSL = requiredMinSL; // 强制使用更宽的、符合最低要求的止损
-         if(g_Logger != NULL && EnableDebug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离要求，强制拓宽至 %.5f", originalSL, finalSL));
+         if(g_Logger != NULL && ST_Debug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离要求，强制拓宽至 %.5f", originalSL, finalSL));
       }
    }
    else // SELL
@@ -143,7 +145,7 @@ double CalculateFinalStopLoss(double actualOpenPrice, double originalSL, ENUM_OR
       if(finalSL < requiredMinSL)
       {
          finalSL = requiredMinSL; // 强制使用更宽的、符合最低要求的止损
-         if(g_Logger != NULL && EnableDebug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离要求，强制拓宽至 %.5f", originalSL, finalSL));
+         if(g_Logger != NULL && ST_Debug) g_Logger.WriteWarning(StringFormat("原始SL (%.5f) 不满足最小距离要求，强制拓宽至 %.5f", originalSL, finalSL));
       }
    }
    
