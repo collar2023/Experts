@@ -3,7 +3,7 @@
 //|               Central Parameter Structures for SuperTrend EA     |
 //|                                                    Version: 6.0  |
 //+------------------------------------------------------------------+
-#property strict
+
 
 //--- 从 Common_Defines.mqh 迁移
 #ifndef ORDER_TYPE_NONE
