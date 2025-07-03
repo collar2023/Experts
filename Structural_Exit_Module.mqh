@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//| Structural_Exit_Module.mqh v1.9 (2025‑07‑08)                     |
-//| ★ v1.9: 请求冷却版 - 引入时间锁，解决重复修改失败和10036刷屏问题 |
-//|   在发送修改请求后，增加一个短暂的冷却期，避免因状态同步延迟     |
-//|   导致向服务器发送大量重复的、无效的指令。                       |
-//|   继承 v1.8 所有降频和时间保护功能。                             |
+//| Structural_Exit_Module.mqh v1.9 Enhanced (2025‑07‑08)          |
+//| ★ v1.9 Enhanced: 请求冷却增强版 - 屏蔽10036刷屏 + 延长冷却期   |
+//|   1. 屏蔽10036、10027、10018等常见无害错误码的打印输出          |
+//|   2. 冷却期从5秒延长到15秒，进一步减少重复请求                   |
+//|   3. 继承所有v1.9原有功能和保护机制                              |
 //+------------------------------------------------------------------+
 #property strict
 //==================================================================
@@ -41,7 +41,7 @@ static datetime se_last_failed_bar_time = 0;
 static datetime se_position_open_time = 0;
 static int      se_position_hold_bars = 0;
 
-// ★★★ v1.9 核心新增: 请求冷却机制变量 ★★★
+// ★★★ v1.9 核心: 请求冷却机制变量 ★★★
 static ulong    se_last_modify_request_ticket = 0; // 记录上次发送修改请求的票据
 static datetime se_last_modify_request_time = 0; // 记录上次发送修改请求的时间
 
@@ -80,10 +80,10 @@ bool InitStructuralExitModule(const SStructuralExitInputs &in)
    se_last_modify_request_ticket = 0;
    se_last_modify_request_time = 0;
    
-   Print("[SE] 模块 v1.9 初始化完成 (请求冷却终极版)");
+   Print("[SE] 模块 v1.9 Enhanced 初始化完成 (15秒冷却期 + 静默错误处理)");
    Print("[SE] 保本操作: 每tick更新 (快速响应)");
    Print("[SE] 结构化止损更新频率: ", (in.UpdateFrequency==0?"每tick":in.UpdateFrequency==1?"每K线":"每"+IntegerToString(in.UpdateInterval)+"根K线"));
-   Print("[SE] 冷却期: ", in.CooldownBars, " 根K线");
+   Print("[SE] 冷却期: ", in.CooldownBars, " 根K线 (请求间隔: 15秒)");
    Print("[SE] 最小持仓: ", in.MinHoldBars, " 根K线");
    return true;
 }
@@ -418,12 +418,12 @@ bool ProcessStructuralExit(const SStructuralExitInputs &in, ulong ticket)
 }
 
 //==================================================================
-//  辅助函数
+//  辅助函数 - Enhanced版本
 //==================================================================
 bool ModifyPosition(ulong ticket, double new_sl, double new_tp = 0)
 {
-   // ★★★ v1.9 核心逻辑：请求冷却的“节流阀” ★★★
-   if(ticket == se_last_modify_request_ticket && TimeCurrent() - se_last_modify_request_time < 5) // 5秒冷却期
+   // ★★★ v1.9 Enhanced: 15秒冷却期的"节流阀" ★★★
+   if(ticket == se_last_modify_request_ticket && TimeCurrent() - se_last_modify_request_time < 15) // 从5秒延长到15秒
    {
       return false; // 请求过于频繁，跳过
    }
@@ -456,7 +456,11 @@ bool ModifyPosition(ulong ticket, double new_sl, double new_tp = 0)
    
    if(!OrderSend(request, result))
    {
-      Print("[SE] 修改持仓失败: ", result.comment, " (", result.retcode, ")");
+      // ★★★ Enhanced: 屏蔽常见无害错误码的打印输出 ★★★
+      if(result.retcode != 10036 && result.retcode != 10027 && result.retcode != 10018)
+      {
+         Print("[SE] 修改持仓失败: ", result.comment, " (", result.retcode, ")");
+      }
       return false;
    }
    
