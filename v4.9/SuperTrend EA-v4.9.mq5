@@ -1,14 +1,13 @@
 //+------------------------------------------------------------------+
-//| SuperTrend EA – v4.9 (最终版)                                    |
+//| SuperTrend EA – v4.9(实盘修正版)                              |
 //+------------------------------------------------------------------+
 //|                                     © 2025                       |
-//|  • 修复: 移除了所有.mqh文件中的#property指令，解决了底层编译错误。|
-//|  • 修复: 使用正确的API查询历史成交，解决了所有编译警告和错误。   |
+//|  • 修复: 为平仓事件检测添加触发锁，彻底解决日志刷屏问题。        |
+//|  • 修复: 优化二次进场观察点记录逻辑，使日志更清晰、准确。        |
 //|  • 继承: 所有v4.9的协同二次进场和参数化功能。                    |
 //+------------------------------------------------------------------+
 #property copyright "© 2025"
-#property version   "4.9" // 最终版
-#property strict
+#property version   "4.9" // 实盘修正版
 
 const string G_EA_VERSION = "4.9";
 
@@ -201,7 +200,7 @@ int OnInit()
    logInputs.enableConsoleLog = InpEnableConsoleLog;
    logInputs.eaVersion = G_EA_VERSION;
    if(!InitializeLogger(logInputs)) { Print("日志初始化失败"); return INIT_FAILED; }
-   g_Logger.WriteInfo("EA v" + G_EA_VERSION + " 启动 (协同二次进场版)");
+   g_Logger.WriteInfo("EA v" + G_EA_VERSION + " 启动 (实盘修正版)");
 
    g_riskInputs.magicNumber        = InpMagicNumber;
    g_riskInputs.useFixedLot        = Risk_useFixedLot;
@@ -279,10 +278,11 @@ void OnTick()
 {
    bool isInPosition_thisTick = PositionSelect(_Symbol);
 
-   // ★★★ 核心协同逻辑：检测平仓事件 (最终修复版) ★★★
+   // ★★★ 核心协同逻辑：检测平仓事件 (v4.9.1 终极修复版) ★★★
    if(g_wasInPosition_lastTick && !isInPosition_thisTick)
    {
-      if(g_reEntryInputs.enableReEntry)
+      // 触发锁: 只有在观察哨兵未设立时，才执行检测，防止刷屏
+      if(g_reEntryInputs.enableReEntry && g_reEntryHigh == 0.0 && g_reEntryLow == 0.0)
       {
          if(HistorySelect(0, TimeCurrent()))
          {
@@ -301,16 +301,28 @@ void OnTick()
                      {
                         datetime dealTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
                         ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+                        string log_msg = "[系统] 检测到平仓，";
 
                         MqlRates rates[1];
                         if(CopyRates(_Symbol, _Period, dealTime, 1, rates) > 0)
                         {
-                           if(dealType == DEAL_TYPE_SELL) g_reEntryHigh = rates[0].high;
-                           else if(dealType == DEAL_TYPE_BUY) g_reEntryLow = rates[0].low;
-                           
-                           if(g_Logger) g_Logger.WriteInfo(StringFormat("检测到平仓，激活二次进场观察模式: High=%.5f, Low=%.5f", g_reEntryHigh, g_reEntryLow));
+                           // 平掉一个BUY持仓，记录高点
+                           if(dealType == DEAL_TYPE_SELL) 
+                           {
+                              g_reEntryHigh = rates[0].high;
+                              g_reEntryLow = 0.0; // 明确重置另一个
+                              log_msg += StringFormat("激活高点观察哨 at %.5f", g_reEntryHigh);
+                           }
+                           // 平掉一个SELL持仓，记录低点
+                           else if(dealType == DEAL_TYPE_BUY) 
+                           {
+                              g_reEntryLow = rates[0].low;
+                              g_reEntryHigh = 0.0; // 明确重置另一个
+                              log_msg += StringFormat("激活低点观察哨 at %.5f", g_reEntryLow);
+                           }
+                           if(g_Logger) g_Logger.WriteInfo(log_msg);
                         }
-                        break; 
+                        break; // 找到最近的平仓成交后就跳出循环
                      }
                   }
                }
