@@ -334,7 +334,7 @@ void OnTick()
    if(isInPosition_thisTick) 
    {
       ulong ticket = PositionGetInteger(POSITION_TICKET);
-      ProcessStructuralExit(g_structExitInputs, ticket, g_initialSL);
+      ProcessStructuralExit(g_structExitInputs, ticket);
    }
    else
    {

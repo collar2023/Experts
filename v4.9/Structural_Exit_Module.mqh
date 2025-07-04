@@ -1,5 +1,6 @@
 //+------------------------------------------------------------------+
-//| Structural_Exit_Module.mqh v4.9 (参数显性化 & 日志增强版)        |
+//| Structural_Exit_Module.mqh v4.9(健壮性优化版)                 |
+//| • 优化: 模块内部管理初始止损，不再依赖外部传入，提高逻辑健壮性。 |
 //+------------------------------------------------------------------+
 
 // ★★★ 移除 #property strict
@@ -15,6 +16,11 @@ static datetime se_position_open_time = 0;
 static int      se_position_hold_bars = 0;
 static ulong    se_last_modify_request_ticket = 0;
 static datetime se_last_modify_request_time = 0;
+
+// ★ NEW: 用于独立跟踪仓位初始状态的变量
+static ulong    se_tracked_ticket = 0;
+static double   se_initial_sl_for_ticket = 0.0;
+
 extern CLogModule* g_Logger;
 
 //==================================================================
@@ -38,7 +44,6 @@ bool ModifyPosition(const SStructuralExitInputs &in, ulong ticket, double new_sl
    se_last_modify_request_time = TimeCurrent();
    if(!OrderSend(request,result))
    {
-      // ★ 核心增强: 静默处理常见的、无害的服务器错误码
       if(result.retcode != TRADE_RETCODE_NO_CHANGES && result.retcode != 10036 && result.retcode != 10027 && result.retcode != 10018)
       {
          if(g_Logger) g_Logger.WriteWarning(StringFormat("[SE] 修改持仓失败: %s (%d)", result.comment, result.retcode));
@@ -66,7 +71,8 @@ bool InitStructuralExitModule(const SStructuralExitInputs &in)
    }
    se_last_processed_bar=0; se_bar_counter=0; se_position_open_time=0; se_position_hold_bars=0;
    se_last_modify_request_ticket=0; se_last_modify_request_time=0;
-   if(g_Logger) g_Logger.WriteInfo("[SE] 结构化离场模块 v4.9 初始化完成 (集成日志增强)");
+   se_tracked_ticket = 0; se_initial_sl_for_ticket = 0.0; // 初始化新变量
+   if(g_Logger) g_Logger.WriteInfo("[SE] 结构化离场模块 v4.9.2 初始化完成 (健壮性优化版)");
    return true;
 }
 
@@ -111,17 +117,23 @@ bool IsMinHoldTimeMet(const SStructuralExitInputs &in)
 //==================================================================
 //  核心离场逻辑
 //==================================================================
-bool ProcessBreakeven(const SStructuralExitInputs &in, ulong ticket, double initialSL)
+// ★ MODIFIED: 不再需要传入 initialSL
+bool ProcessBreakeven(const SStructuralExitInputs &in, ulong ticket)
 {
-   if(!in.enableBreakeven || initialSL == 0) return false;
+   // ★ 使用模块内部记录的初始SL
+   if(!in.enableBreakeven || se_initial_sl_for_ticket == 0) return false;
+
    if(!PositionSelectByTicket(ticket)) return false;
    double entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
    double current_sl = PositionGetDouble(POSITION_SL);
    ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
    double current_price = (pos_type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double buffer = in.breakevenBufferPips * _Point;
-   double risk_dist = MathAbs(entry_price - initialSL);
+
+   // ★ 使用正确的、模块内部存储的初始止损来计算风险
+   double risk_dist = MathAbs(entry_price - se_initial_sl_for_ticket);
    if(risk_dist <= 0) return false;
+
    double profit_dist = (pos_type == POSITION_TYPE_BUY) ? (current_price - entry_price) : (entry_price - current_price);
    if(profit_dist >= risk_dist * in.breakevenTriggerRR)
    {
@@ -206,10 +218,35 @@ bool ProcessATRTrail(const SStructuralExitInputs &in, ulong ticket)
 //==================================================================
 void RecordPositionOpenTime() { se_position_open_time = TimeCurrent(); }
 
-bool ProcessStructuralExit(const SStructuralExitInputs &in, ulong ticket, double initialSL)
+// ★ MODIFIED: 主处理函数，增加了仓位跟踪和初始SL的内部管理
+bool ProcessStructuralExit(const SStructuralExitInputs &in, ulong ticket)
 {
+   // 当检测到新的持仓票据时，记录其初始止损位，并重置模块内部状态
+   if(ticket != se_tracked_ticket)
+   {
+      if(PositionSelectByTicket(ticket))
+      {
+         se_initial_sl_for_ticket = PositionGetDouble(POSITION_SL);
+         se_tracked_ticket = ticket;
+         se_position_open_time = 0; // 重置开仓时间，让模块重新计时
+         if(g_Logger && se_initial_sl_for_ticket > 0) 
+         {
+            g_Logger.WriteInfo(StringFormat("[SE] 开始跟踪新仓位 %d, 记录初始SL: %.5f", ticket, se_initial_sl_for_ticket));
+         }
+      }
+      else // 如果按票据找不到仓位，说明仓位已平，重置跟踪状态
+      {
+          se_tracked_ticket = 0;
+          se_initial_sl_for_ticket = 0.0;
+          return false;
+      }
+   }
+
    if(se_position_open_time == 0) RecordPositionOpenTime();
-   bool action_taken = ProcessBreakeven(in, ticket, initialSL);
+
+   // 调用不带 initialSL 参数的保本函数
+   bool action_taken = ProcessBreakeven(in, ticket);
+   
    if(!IsMinHoldTimeMet(in)) return action_taken;
    if(ProcessStructuralStop(in, ticket)) return true;
    if(ProcessATRTrail(in, ticket)) return true;
