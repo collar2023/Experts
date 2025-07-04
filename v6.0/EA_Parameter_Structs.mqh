@@ -1,8 +1,19 @@
 //+------------------------------------------------------------------+
 //|                                     EA_Parameter_Structs.mqh     |
 //|               Central Parameter Structures for SuperTrend EA     |
-//|                                                    Version: 6.0  |
+//|                                                    Version: 6.4  |
 //+------------------------------------------------------------------+
+#property strict
+
+// ★ NEW: 动作状态返回枚举，用于模块优先级管理
+enum ENUM_ACTION_STATUS
+{
+   ACTION_NONE,             // 无任何操作
+   ACTION_MODIFIED_SL_TP,   // 修改了止损/止盈
+   ACTION_PARTIAL_CLOSE,    // 执行了部分平仓
+   ACTION_FULL_CLOSE,       // 执行了全部平仓
+   ACTION_ERROR             // 发生错误 (预留)
+};
 
 
 //--- 从 Common_Defines.mqh 迁移
@@ -10,13 +21,15 @@
    #define ORDER_TYPE_NONE ((ENUM_ORDER_TYPE)(-1))
 #endif
 
-//--- 主策略枚举
+// ★ REMOVED: 废除互斥的离场模式枚举，改用独立的布尔开关
+/*
 enum ENUM_BASE_EXIT_MODE
 {
    EXIT_MODE_STRUCTURAL, // 0: 使用结构化离场模块
    EXIT_MODE_SAR,        // 1: 使用SAR/ADX离场模块 (备注: R-Multiple 分步止盈可与任一模式叠加)
    EXIT_MODE_NONE        // 2: 不使用基础离场策略 (仅依赖R-Multiple或手动)
 };
+*/
 
 enum ENUM_SE_UPDATE_FREQ
 {
@@ -121,6 +134,7 @@ struct SSarAdxExitInputs
 //--- 结构化离场模块参数结构体
 struct SStructuralExitInputs
 {
+   // ★ MODIFIED: 此处开关现在直接由主文件的input bool控制
    bool   EnableStructuralExit;
    bool   EnableBreakeven;
    double BreakevenTriggerRR;

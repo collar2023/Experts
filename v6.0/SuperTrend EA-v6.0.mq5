@@ -1,17 +1,17 @@
 //+------------------------------------------------------------------+
-//| SuperTrend EA – v6.2 (终极编译修复版)                            |
+//| SuperTrend EA – v6.4 (最终架构版)                                |
 //+------------------------------------------------------------------+
 //|                                     © 2025                       |
-//|  • 修复: 解决了所有 'extern' 和函数声明导致的编译错误。          |
-//|  • 优化: 使用常量统一管理版本号，遵循两级编码规则。              |
+//|  • 架构: 采用独立布尔开关控制离场模块，实现策略的自由组合。      |
+//|  • 核心: 优先级管理机制确保不同模块协同工作时稳定无冲突。        |
 //+------------------------------------------------------------------+
 #property copyright "© 2025"
-#property version   "6.2" // 终极编译修复版
+#property version   "6.4" // 最终架构版
 
-// ★ FIX: 定义版本号常量，确保统一
-const string G_EA_VERSION = "6.2";
+// ★ 定义版本号常量，确保统一
+const string G_EA_VERSION = "6.4";
 
-//===================== 模块引入 (★ 修正了顺序) ========================
+//===================== 模块引入 ========================
 #include <Trade/Trade.mqh>
 #include <Arrays/ArrayDouble.mqh>
 
@@ -23,7 +23,7 @@ const string G_EA_VERSION = "6.2";
 #include "Structural_Exit_Module.mqh"
 
 
-//===================== 全局对象 & 变量 (★ 唯一真实定义处) ===============
+//===================== 全局对象 & 变量 ===============================
 CLogModule* g_Logger = NULL;
 CTrade      g_trade;
 
@@ -36,8 +36,9 @@ input bool   EnableDebug             = true;
 
 // --- Strategy Mode & Core Logic ---
 input group "--- Strategy Mode & Core Logic ---"
-input ENUM_BASE_EXIT_MODE BaseExitStrategy = EXIT_MODE_STRUCTURAL;
-input bool   Enable_R_Multiple_Exit  = true;
+// ★ MODIFIED: 使用独立的布尔开关代替枚举，实现策略的自由组合
+input bool   Enable_Structural_Exit  = true;     // 开关：启用结构化离场 (移动止损、保本)
+input bool   Enable_R_Multiple_Exit  = true;     // 开关：启用R倍数/SAR离场 (分步止盈、反转平仓)
 input int    EmergencyATRPeriod      = 14;
 input double EmergencyATRMultiplier  = 1.5;
 input int    Entry_CooldownSeconds   = 0;
@@ -242,9 +243,9 @@ int OnInit()
    logInputs.logLevel = InpLogLevel;
    logInputs.enableFileLog = InpEnableFileLog;
    logInputs.enableConsoleLog = InpEnableConsoleLog;
-   logInputs.eaVersion = G_EA_VERSION; // ★ FIX: 使用版本常量
+   logInputs.eaVersion = G_EA_VERSION;
    if(!InitializeLogger(logInputs)) { Print("日志初始化失败"); return INIT_FAILED; }
-   g_Logger.WriteInfo("EA v" + G_EA_VERSION + " 启动 (参数完全显性化版)");
+   g_Logger.WriteInfo("EA v" + G_EA_VERSION + " 启动 (最终架构版)");
 
    // 2. 填充所有参数结构体
    // -- 填充风控参数 --
@@ -281,7 +282,8 @@ int OnInit()
    g_entryInputs.adxMinStrength        = Entry_adxMinStrength;
 
    // -- 填充结构化离场参数 --
-   g_structExitInputs.EnableStructuralExit = (BaseExitStrategy == EXIT_MODE_STRUCTURAL);
+   // ★ MODIFIED: 直接使用布尔开关进行赋值
+   g_structExitInputs.EnableStructuralExit = Enable_Structural_Exit;
    g_structExitInputs.EnableBreakeven = SE_EnableBreakeven;
    g_structExitInputs.BreakevenTriggerRR = SE_BreakevenTriggerRR;
    g_structExitInputs.BreakevenBufferPips = SE_BreakevenBufferPips;
@@ -320,8 +322,12 @@ int OnInit()
    // 3. 使用填充好的结构体初始化所有模块
    InitRiskModule(g_riskInputs);
    if(!InitEntryModule(_Symbol, _Period, g_entryInputs)) return INIT_FAILED;
-   if(!InitExitModule(_Symbol, _Period, g_sarAdxExitInputs)) return INIT_FAILED;
-   if(g_structExitInputs.EnableStructuralExit)
+   // ★ MODIFIED: 根据独立的开关初始化模块
+   if(Enable_R_Multiple_Exit)
+   {
+      if(!InitExitModule(_Symbol, _Period, g_sarAdxExitInputs)) return INIT_FAILED;
+   }
+   if(Enable_Structural_Exit)
    {
       if(!InitStructuralExitModule(g_structExitInputs)) return INIT_FAILED;
    }
@@ -339,13 +345,16 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    DeinitRiskModule(); 
-   DeinitEntryModule(); 
-   DeinitExitModule(); 
-   if(BaseExitStrategy == EXIT_MODE_STRUCTURAL)
+   DeinitEntryModule();
+   
+   // ★ MODIFIED: 根据独立的开关清理模块
+   if(Enable_R_Multiple_Exit) DeinitExitModule(); 
+   if(Enable_Structural_Exit)
    {
       DeinitStructuralExitModule();
       ResetPositionRecord();
    }
+   
    if(g_emergencyAtrHandle != INVALID_HANDLE) IndicatorRelease(g_emergencyAtrHandle);
    if(g_Logger != NULL) 
    {
@@ -363,7 +372,8 @@ void OnTick()
    }
    else
    {
-      if(BaseExitStrategy == EXIT_MODE_STRUCTURAL) ResetPositionRecord(); 
+      // ★ MODIFIED: 根据开关重置记录
+      if(Enable_Structural_Exit) ResetPositionRecord(); 
       
       if(!CanOpenNewTrade(g_riskInputs, EnableDebug)) return;
       if(g_lastOpenTime > 0 && TimeCurrent() - g_lastOpenTime < Entry_CooldownSeconds) return;
@@ -399,7 +409,8 @@ void OpenPosition(ENUM_ORDER_TYPE type, double sl)
    {
       g_initialSL = sl; g_step1Done = false; g_step2Done = false;
       g_lastOpenTime = TimeCurrent(); g_lastTrendHigh = 0.0; g_lastTrendLow = 0.0;
-      if(BaseExitStrategy == EXIT_MODE_STRUCTURAL && PositionSelect(_Symbol))
+      // ★ MODIFIED: 根据开关记录仓位
+      if(Enable_Structural_Exit && PositionSelect(_Symbol))
       {
          ulong ticket = PositionGetTicket(0);
          RecordPositionOpen(ticket);
@@ -408,64 +419,111 @@ void OpenPosition(ENUM_ORDER_TYPE type, double sl)
    }
 }
 
-//======================== 持仓管理函数 ======================
+
+// ★ NEW: R-Multiple 和 SAR/ADX 离场逻辑封装
+//==================================================================
+ENUM_ACTION_STATUS Process_R_Multiple_Exit()
+{
+   if(!PositionSelect(_Symbol)) return ACTION_NONE;
+   
+   double openP = PositionGetDouble(POSITION_PRICE_OPEN); 
+   ENUM_POSITION_TYPE pType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   
+   double pct = (pType == POSITION_TYPE_BUY) ? 
+                GetLongExitAction(openP, g_initialSL, g_step1Done, g_step2Done) : 
+                GetShortExitAction(openP, g_initialSL, g_step1Done, g_step2Done);
+   
+   if(pct > 0.0)
+   {
+      if(pct >= 100.0) 
+      {
+         // ★ MODIFIED: 简化平仓理由
+         string reason = "R-Multiple / SAR 信号";
+         if(g_Logger != NULL) g_Logger.WriteInfo(reason + "触发，平掉所有仓位。");
+         if(g_trade.PositionClose(_Symbol))
+         {
+            // ★ MODIFIED: 根据开关重置记录
+            if(Enable_Structural_Exit) ResetPositionRecord();
+            return ACTION_FULL_CLOSE;
+         }
+      }
+      else
+      {
+         double vol = PositionGetDouble(POSITION_VOLUME); 
+         double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+         double volClose = MathFloor((vol * pct / 100.0) / step) * step; 
+         volClose = MathMax(volClose, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
+         
+         if(volClose > 0 && volClose < vol)
+         {
+            if(g_trade.PositionClosePartial(_Symbol, volClose))
+            {
+               if(g_Logger != NULL) g_Logger.WriteInfo(StringFormat("R-Multiple 部分止盈: 平仓 %.2f 手 (目标平仓比例 %.1f%%)", volClose, pct));
+               if(g_step1Done == false) g_step1Done = true;
+               else if(g_step2Done == false) g_step2Done = true;
+               return ACTION_PARTIAL_CLOSE;
+            }
+         }
+      }
+   }
+   return ACTION_NONE;
+}
+
+// ★ REWRITTEN: 持仓管理函数 (最终优先级管理版)
+//==================================================================
 void ManagePosition()
 {
+   // --- 1. 更新新K线上的状态变量 ---
    static datetime last_bar_time = 0;
    datetime current_bar_time = (datetime)SeriesInfoInteger(_Symbol, _Period, SERIES_LASTBAR_DATE);
    if(current_bar_time > last_bar_time)
    {
-      ENUM_POSITION_TYPE pType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      if(pType == POSITION_TYPE_BUY) { double prevHigh = iHigh(_Symbol, _Period, 1); if(g_lastTrendHigh == 0.0 || prevHigh > g_lastTrendHigh) g_lastTrendHigh = prevHigh; }
-      else { double prevLow = iLow(_Symbol, _Period, 1); if(g_lastTrendLow == 0.0 || prevLow < g_lastTrendLow) g_lastTrendLow = prevLow; }
+      if(PositionSelect(_Symbol))
+      {
+         ENUM_POSITION_TYPE pType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         if(pType == POSITION_TYPE_BUY) { 
+            double prevHigh = iHigh(_Symbol, _Period, 1); 
+            if(g_lastTrendHigh == 0.0 || prevHigh > g_lastTrendHigh) g_lastTrendHigh = prevHigh; 
+         }
+         else { 
+            double prevLow = iLow(_Symbol, _Period, 1); 
+            if(g_lastTrendLow == 0.0 || prevLow < g_lastTrendLow) g_lastTrendLow = prevLow; 
+         }
+      }
       last_bar_time = current_bar_time;
    }
    
-   if(BaseExitStrategy == EXIT_MODE_STRUCTURAL) 
+   // --- 2. 优先级离场管理 ---
+   if(!PositionSelect(_Symbol)) return;
+   
+   ENUM_ACTION_STATUS actionStatus = ACTION_NONE;
+   ulong ticket = PositionGetTicket(0);
+
+   // 【优先级 1】结构化退出模块 (负责移动止损、保本)
+   if(Enable_Structural_Exit)
    {
-      if(PositionSelect(_Symbol))
+      actionStatus = ProcessStructuralExit(g_structExitInputs, ticket);
+      if(actionStatus == ACTION_MODIFIED_SL_TP)
       {
-         ulong ticket = PositionGetTicket(0);
-         ProcessStructuralExit(g_structExitInputs, ticket);
+         if(g_Logger != NULL && EnableDebug) g_Logger.WriteInfo("本轮Tick活跃模块: 结构化退出 (修改SL)");
+         return; // ★★★ 核心：执行了操作，则终止本轮Tick，防止冲突
       }
    }
    
+   if(!PositionSelect(_Symbol)) return;
+
+   // 【优先级 2】R-Multiple / SAR 退出模块 (负责分步止盈或反转平仓)
    if(Enable_R_Multiple_Exit)
    {
-      if(!PositionSelect(_Symbol)) return;
-      double openP = PositionGetDouble(POSITION_PRICE_OPEN); 
-      ENUM_POSITION_TYPE pType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      
-      double pct = (pType == POSITION_TYPE_BUY) ? 
-                   GetLongExitAction(openP, g_initialSL, g_step1Done, g_step2Done) : 
-                   GetShortExitAction(openP, g_initialSL, g_step1Done, g_step2Done);
-      
-      if(pct > 0.0)
+      actionStatus = Process_R_Multiple_Exit();
+      if(actionStatus != ACTION_NONE)
       {
-         if(pct >= 100.0) 
-         {
-            string reason = (BaseExitStrategy == EXIT_MODE_SAR) ? "SAR反转" : "R-Multiple全仓";
-            if(g_Logger != NULL) g_Logger.WriteInfo(reason + "信号触发，平掉所有仓位。");
-            g_trade.PositionClose(_Symbol);
-            if(BaseExitStrategy == EXIT_MODE_STRUCTURAL) ResetPositionRecord(); 
-         }
-         else
-         {
-            double vol = PositionGetDouble(POSITION_VOLUME); 
-            double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-            double volClose = MathFloor((vol * pct / 100.0) / step) * step; 
-            volClose = MathMax(volClose, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN));
-            
-            if(volClose > 0 && volClose < vol)
-            {
-               if(g_trade.PositionClosePartial(_Symbol, volClose))
-               {
-                  if(g_Logger != NULL) g_Logger.WriteInfo(StringFormat("R-Multiple 部分止盈: 平仓 %.2f 手 (目标平仓比例 %.1f%%)", volClose, pct));
-                  if(g_step1Done == false) g_step1Done = true;
-                  else if(g_step2Done == false) g_step2Done = true;
-               }
-            }
-         }
+          if(g_Logger != NULL && EnableDebug)
+          {
+             string reason = (actionStatus == ACTION_FULL_CLOSE) ? "全部平仓" : "部分平仓";
+             g_Logger.WriteInfo(StringFormat("本轮Tick活跃模块: R-Multiple/SAR退出 (%s)", reason));
+          }
+         return; // 执行了操作，则终止本轮Tick
       }
    }
 }
