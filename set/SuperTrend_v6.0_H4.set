@@ -1,0 +1,58 @@
+
+; SuperTrend EA v6.0 参数文件 (H4)
+EnableDebug=true
+InpMagicNumber=6000240
+
+; --- 风控设置 ---
+Risk_useFixedLot=false
+Risk_fixedLot=0.01
+Risk_riskPercent=1.0
+Risk_minStopATRMultiple=1.0
+Risk_atrPeriod=21
+Risk_minStopPoints=10.0
+Risk_maxLotByBalance=50.0
+Risk_maxAbsoluteLot=1.0
+Risk_enableLotLimit=true
+Risk_slippage=3.0
+Risk_dailyLossLimitPct=10.0
+Risk_AllowNewTrade=true
+
+; --- 入场设置 ---
+Entry_stIndicatorName=supertrend-free
+Entry_atrPeriod=14
+Entry_atrMultiplier=3.0
+Entry_stopLossBufferPips=10
+Entry_useDynamicBuffer=true
+Entry_minBufferPips=5.0
+Entry_maxBufferPips=30.0
+Entry_sessionMultiplier=1.2
+Entry_volatilityFactor=0.8
+
+Entry_useAnomalyDetection=true
+Entry_newsBufferMultiplier=1.5
+Entry_highVolMultiplier=1.3
+Entry_rangeBoundMultiplier=0.8
+
+Entry_useADXFilter=true
+Entry_adxPeriod=14
+Entry_adxMinStrength=23.0
+
+; --- 平仓设置 ---
+SE_EnableBreakeven=true
+SE_BreakevenTriggerRR=1.5
+SE_BreakevenBufferPips=2.0
+SE_EnableStructureStop=true
+SE_StructureLookback=21
+SE_StructureBufferPips=3.0
+SE_EnableATRFallback=true
+SE_ATRTrailPeriod=21
+SE_ATRTrailMultiplier=1.5
+SE_UpdateFrequency=0
+SE_UpdateInterval=1
+SE_CooldownBars=3
+SE_MinHoldBars=5
+SE_ModifyRequestCooldownSeconds=15
+
+; --- 二次入场设置 ---
+ReEntry_Enable=true
+ReEntry_BufferPips=1.0
