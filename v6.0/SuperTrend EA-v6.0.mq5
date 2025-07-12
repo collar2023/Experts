@@ -55,11 +55,11 @@ input group "--- Risk Management Settings ---"
 input bool     Risk_useFixedLot        = false;
 input double   Risk_fixedLot           = 0.01;
 input double   Risk_riskPercent        = 1.0;
-input double   Risk_minStopATRMultiple = 1.0;
+input double   Risk_minStopATRMultiple = 2.0;
 input int      Risk_atrPeriod          = 14;
 input double   Risk_minStopPoints      = 10.0;
 input double   Risk_maxLotByBalance    = 50.0;
-input double   Risk_maxAbsoluteLot     = 1.0;
+input double   Risk_maxAbsoluteLot     = 0.1;
 input bool     Risk_enableLotLimit     = true;
 input double   Risk_slippage           = 3.0;
 input double   Risk_dailyLossLimitPct  = 10.0;
