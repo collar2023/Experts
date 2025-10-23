@@ -85,7 +85,7 @@ input double   Entry_adxMinStrength     = 23.0;
 input group "--- Structural Exit Settings ---"
 input bool   SE_EnableBreakeven      = true;
 input double SE_BreakevenTriggerRR   = 1.5;
-input double SE_BreakevenBufferPips  = 2.0;
+input double SE_BreakevenBufferPips  = 5.0;
 input bool   SE_EnableStructureStop  = true;
 input int    SE_StructureLookback    = 21;
 input double SE_StructureBufferPips  = 3.0;
