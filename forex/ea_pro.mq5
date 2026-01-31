@@ -350,7 +350,7 @@ void ManageRisk(string symbol, ulong ticket)
       double breakEvenPrice = entryPrice;
       double currentSL = PositionGetDouble(POSITION_SL);
       bool needBreakEven = false;
-      double protectBuffer = SymbolInfoDouble(symbol, SYMBOL_POINT) * 5; // 外汇5点缓冲
+      double protectBuffer = SymbolInfoDouble(symbol, SYMBOL_POINT) * 30; // [Exness-Forex] 30点缓冲 // 外汇5点缓冲
 
       if(type == POSITION_TYPE_BUY)
       {

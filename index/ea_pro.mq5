@@ -301,7 +301,7 @@ void ManageRisk(string symbol, ulong ticket)
       double breakEvenPrice = entryPrice;
       double currentSL = PositionGetDouble(POSITION_SL);
       bool needBreakEven = false;
-      double protectBuffer = SymbolInfoDouble(symbol, SYMBOL_POINT) * 20; // 指数20点缓冲
+      double protectBuffer = SymbolInfoDouble(symbol, SYMBOL_POINT) * 100; // [Exness-Index] 100点缓冲 // 指数20点缓冲
 
       if(type == POSITION_TYPE_BUY)
       {

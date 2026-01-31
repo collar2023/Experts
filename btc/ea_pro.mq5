@@ -339,13 +339,13 @@ void ManageRisk(string symbol, ulong ticket) // [cite: 80]
    } // [cite: 88]
 
    // 2. 保本逻辑
-   double breakEvenTrigger = (trailingStartPercent < 1.5) ? 1.5 : trailingStartPercent; // 动态调整保本触发线
+   double breakEvenTrigger = (trailingStartPercent < 0.8) ? 0.8 : trailingStartPercent; // [M15] 动态调整保本触发线 (下调至 0.8%)
    if(pnlPercent >= breakEvenTrigger) // [cite: 89]
    {
       double breakEvenPrice = entryPrice;
       double currentSL = PositionGetDouble(POSITION_SL);
       bool needBreakEven = false; // [cite: 90]
-      double protectBuffer = SymbolInfoDouble(symbol, SYMBOL_POINT) * 50; // 加密货币点差大，增加保护 buffer
+      double protectBuffer = SymbolInfoDouble(symbol, SYMBOL_POINT) * 2000; // [M15-BTC] 提高缓冲至 2000 点，覆盖 BTC 高额点差与手续费
 
       if(type == POSITION_TYPE_BUY) // [cite: 91]
       {
