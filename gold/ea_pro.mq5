@@ -1,33 +1,33 @@
 //+------------------------------------------------------------------+
-//|               SignalPollerEA_Gold_Plus_v6.1.mq5                  |
-//|          黄金/石油/通用版 - 商业级稳健架构 (Pro 版)             |
+//|               SignalPollerEA_Gold_Pro_v7.1.mq5                   |
+//|          黄金/石油/通用版 - 商业级稳健架构 (含自动回补功能)      |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade\Trade.mqh>
 
-//--- ==========================================
+//--- ========================================== 
 //--- 1. 基础连接设置
-//--- ==========================================
+//--- ========================================== 
 // [重要] 请在 URL 后加上 ?token=您的Token
 input string serverUrl            = "https://gold.460001.xyz/get_signal?token=121218679";
-input int    timerSeconds         = 1;          // ✅ 极速轮询
+input int    timerSeconds         = 1;          // 极速轮询
 input ulong  magicNumber          = 640002;     // ⚠️ 注意: 不同品种挂EA时，请修改此号码
-input bool   manageManualOrders   = true;       // ✅ 是否接管手动开出的订单 (Magic=0)
+input bool   manageManualOrders   = true;       // 是否接管手动开出的订单 (Magic=0)
 
-// ✅ [核心] 交易品种白名单 (请严格输入: 区分大小写，不要加空格)
+// [核心] 交易品种白名单 (请严格输入: 区分大小写，不要加空格)
 // 作用: 决定当前EA实例只管理哪些品种
 input string allowedSymbols       = "XAUUSDm,XAGUSDm,USOILm";
 
-//--- ==========================================
+//--- ========================================== 
 //--- 2. 仓位与风控核心参数
-//--- ==========================================
+//--- ========================================== 
 input double lotSize              = 0.01;       // 固定手数
 input int    maxPositions         = 2;          // 最大持仓数
 
 input group  "=== 动态止损设置 ==="
 input double baseStopLossPercent  = 0.8;        // 基础止损
 input double heavyPosStopLoss     = 0.6;        // 重仓止损
-input double hardStopLossPercent  = 1.0;        // ✅ 开仓硬止损 (服务器端)
+input double hardStopLossPercent  = 1.0;        // 开仓硬止损 (服务器端)
 
 input group  "=== 移动止盈设置 ==="
 input bool   trailingStopEnabled  = true;       // 是否开启移动止盈
@@ -38,9 +38,15 @@ input double trailGap_Level1      = 0.4;        // 初期回撤
 input double trailGap_Level2      = 0.5;        // 中期回撤
 input double trailGap_Level3      = 0.6;        // 后期回撤
 
-//--- ==========================================
+input group  "=== 自动回补进场 (Auto Re-Entry) ==="
+input bool   enableReEntry        = true;       // 是否开启趋势回调补单
+input double reEntryPullbackPct   = 0.18;       // 回调触发阈值% (例如 0.18% = 4600金价回调8美金)
+input int    maxReEntryTimes      = 2;          // 单个信号允许补单次数
+input int    reEntryCooldown      = 60;         // 补单冷却时间(秒)
+
+//--- ========================================== 
 //--- 3. 通知与日志
-//--- ==========================================
+//--- ========================================== 
 input bool enablePushNotification = true;
 input bool enableHeartbeatPush = true;
 input int  heartbeatInterval = 3600;
@@ -58,10 +64,24 @@ struct PositionTracker
    datetime lastHeartbeatTime;
    bool     startLogSent;
 };
+
+//--- 补单追踪结构体
+struct ReEntryTask {
+   string   symbol;
+   long     type;          // 原持仓方向 (POSITION_TYPE_BUY/SELL)
+   double   exitPrice;     // 出场价格
+   string   signalId;      // 关联的信号ID
+   int      count;         // 已补单次数
+   datetime lastExitTime;  // 上次出场时间
+   bool     active;        // 任务是否激活
+};
+
 //--- 全局变量
 CTrade trade;
 string lastSignalId = "";
+int currentSignalReEntryCount = 0; // 全局计数器：当前信号周期的累计补单次数
 PositionTracker trackers[];
+ReEntryTask reEntries[];
 
 //+------------------------------------------------------------------+
 //| 辅助：内存清理                                                    |
@@ -79,6 +99,21 @@ void CompactTrackers()
       }
    }
    if(writeIndex < total) ArrayResize(trackers, writeIndex);
+}
+
+void CompactReEntries()
+{
+   int writeIndex = 0;
+   int total = ArraySize(reEntries);
+   for(int i = 0; i < total; i++)
+   {
+      if(reEntries[i].active)
+      {
+         if(i != writeIndex) reEntries[writeIndex] = reEntries[i];
+         writeIndex++;
+      }
+   }
+   if(writeIndex < total) ArrayResize(reEntries, writeIndex);
 }
 
 //+------------------------------------------------------------------+
@@ -117,14 +152,18 @@ void SaveLastSignalId(string signalId)
 int OnInit()
 {
    Print("========================================");
-   Print("EA 初始化 - 商业级稳健版 v6.1 (持久化增强)");
+   Print("EA 初始化 - 自动回补增强版 v7.1 (严格风控)");
    Print("========================================");
    
    if(StringFind(serverUrl, "token=") == -1)
       Print("⚠️ 警告: Server URL 似乎未包含 ?token=... 参数！");
 
    lastSignalId = LoadLastSignalId();
+   // 重新加载时，为安全起见，重置补单计数，避免逻辑混乱
+   currentSignalReEntryCount = 0; 
+   
    ArrayResize(trackers, 0);
+   ArrayResize(reEntries, 0);
    
    // 扫描现有持仓 (带白名单过滤)
    for(int i = 0; i < PositionsTotal(); i++)
@@ -150,14 +189,16 @@ int OnInit()
    return(INIT_SUCCEEDED);
 }
 
-void OnDeinit(const int reason) { EventKillTimer(); ArrayFree(trackers); }
+void OnDeinit(const int reason) { EventKillTimer(); ArrayFree(trackers); ArrayFree(reEntries); }
 
 //+------------------------------------------------------------------+
-//| OnTick - 实时风控                                               |
+//| OnTick - 实时风控与回补监控                                      |
 //+------------------------------------------------------------------+
 void OnTick()
 {
    CleanupClosedPositions();
+   
+   // 1. 现有持仓风控
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -166,7 +207,6 @@ void OnTick()
          long magic = PositionGetInteger(POSITION_MAGIC);
          string symbol = PositionGetString(POSITION_SYMBOL);
 
-         // 实时风控白名单过滤
          if( (magic == magicNumber || (manageManualOrders && magic == 0)) && 
              (allowedSymbols=="" || StringFind(allowedSymbols, symbol)!=-1) )
          {
@@ -174,6 +214,9 @@ void OnTick()
          }
       }
    }
+
+   // 2. 自动回补逻辑
+   if(enableReEntry) CheckReEntry();
 }
 
 //+------------------------------------------------------------------+
@@ -183,6 +226,7 @@ void OnTimer()
 {
    // 定期清理内存
    CompactTrackers();
+   CompactReEntries();
 
    uchar post[], result[];
    string response_headers;
@@ -198,17 +242,23 @@ void OnTimer()
       {
          string symbol = ParseJsonValue(jsonResponse,"symbol");
          
-         // 🔥 非白名单信号，跳过但必须更新 ID，防止死循环
+         // 非白名单信号，跳过但必须更新 ID
          if(allowedSymbols!="" && StringFind(allowedSymbols, symbol)==-1) 
          {
-             // 记录下来但不执行，防止下一次轮询卡死
              lastSignalId = newSignalId;
              SaveLastSignalId(newSignalId);
+             currentSignalReEntryCount = 0; // 重置
              return;
          }
 
          lastSignalId = newSignalId;
          SaveLastSignalId(newSignalId);
+         
+         // 新信号到来:
+         // 1. 清空所有基于旧信号的补单任务
+         ArrayResize(reEntries, 0); 
+         // 2. 归零补单计数器
+         currentSignalReEntryCount = 0;
          
          string side   = ParseJsonValue(jsonResponse,"side");
          double qty    = StringToDouble(ParseJsonValue(jsonResponse, "qty"));
@@ -216,7 +266,7 @@ void OnTimer()
          Print(msg);
          SendPushNotification(msg);
 
-         ExecuteTrade(symbol, side, qty);
+         ExecuteTrade(symbol, side, qty, ""); // 正常信号开单
       }
    }
    else if(res == 401)
@@ -230,11 +280,114 @@ void OnTimer()
 }
 
 //+------------------------------------------------------------------+
+//| 注册回补任务                                                      |
+//+------------------------------------------------------------------+
+void RegisterReEntryTask(string symbol, long type, double exitPrice)
+{
+    if(!enableReEntry) return;
+
+    // 严格校验：如果当前信号周期内补单次数已达上限，直接拒绝
+    if(currentSignalReEntryCount >= maxReEntryTimes) {
+        Print("⛔ [回补拒绝] ", symbol, " 当前信号周期补单已达上限 (", currentSignalReEntryCount, "/", maxReEntryTimes, ")");
+        return;
+    }
+
+    // 检查是否已有该品种的活跃任务
+    int index = -1;
+    for(int i=0; i<ArraySize(reEntries); i++) {
+        if(reEntries[i].symbol == symbol && reEntries[i].active) {
+            index = i;
+            break;
+        }
+    }
+    
+    if(index == -1) {
+        index = ArraySize(reEntries);
+        ArrayResize(reEntries, index + 1);
+        reEntries[index].count = 0; 
+    }
+    
+    reEntries[index].symbol       = symbol;
+    reEntries[index].type         = type;
+    reEntries[index].exitPrice    = exitPrice;
+    reEntries[index].signalId     = lastSignalId;
+    reEntries[index].lastExitTime = TimeCurrent();
+    reEntries[index].active       = true;
+
+    double targetPrice = 0;
+    if(type == POSITION_TYPE_BUY) targetPrice = exitPrice * (1.0 - reEntryPullbackPct/100.0);
+    else targetPrice = exitPrice * (1.0 + reEntryPullbackPct/100.0);
+
+    Print("🔄 [回补] 任务已注册: ", symbol, 
+          " 方向=", (type==POSITION_TYPE_BUY?"Buy":"Sell"), 
+          " 目标价<=", DoubleToString(targetPrice, 2),
+          " (Pct:", reEntryPullbackPct, "%, Count:", currentSignalReEntryCount, ")");
+}
+
+//+------------------------------------------------------------------+
+//| 检查回补条件                                                      |
+//+------------------------------------------------------------------+
+void CheckReEntry()
+{
+    for(int i=0; i<ArraySize(reEntries); i++) {
+        if(!reEntries[i].active) continue;
+
+        if(reEntries[i].signalId != lastSignalId) {
+            reEntries[i].active = false;
+            continue;
+        }
+
+        if(TimeCurrent() - reEntries[i].lastExitTime < reEntryCooldown) continue;
+        
+        // 双重校验：执行前再次检查总次数
+        if(currentSignalReEntryCount >= maxReEntryTimes) {
+             reEntries[i].active = false;
+             return;
+        }
+
+        string symbol = reEntries[i].symbol;
+        if(!SymbolInfoInteger(symbol, SYMBOL_SELECT)) SymbolSelect(symbol, true);
+
+        double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+        double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+        
+        bool triggered = false;
+        double targetPrice = 0;
+
+        if(reEntries[i].type == POSITION_TYPE_BUY) {
+            targetPrice = reEntries[i].exitPrice * (1.0 - reEntryPullbackPct/100.0);
+            if(ask <= targetPrice && ask > 0) triggered = true;
+        } 
+        else if(reEntries[i].type == POSITION_TYPE_SELL) {
+            targetPrice = reEntries[i].exitPrice * (1.0 + reEntryPullbackPct/100.0);
+            if(bid >= targetPrice && bid > 0) triggered = true;
+        }
+
+        if(triggered) {
+            Print("⚡ [回补] 触发进场: ", symbol, " 现价=", (reEntries[i].type==POSITION_TYPE_BUY?DoubleToString(ask,2):DoubleToString(bid,2)), 
+                  " 目标价=", DoubleToString(targetPrice, 2));
+            
+            string side = (reEntries[i].type == POSITION_TYPE_BUY) ? "buy" : "sell";
+            
+            // 计数器递增
+            currentSignalReEntryCount++;
+            
+            // 传入注释标记
+            ExecuteTrade(symbol, side, 0, "[ReEntry]"); 
+            
+            reEntries[i].active = false; 
+            
+            string msg = "🔄 自动回补执行: " + symbol + " (累计:" + IntegerToString(currentSignalReEntryCount) + "/" + IntegerToString(maxReEntryTimes) + ")";
+            SendPushNotification(msg);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
 //| 执行交易                                                         |
 //+------------------------------------------------------------------+
-void ExecuteTrade(string symbol, string side, double qty) 
+void ExecuteTrade(string symbol, string side, double qty, string comment = "") 
 {
-   // 品种有效性检查
    if(!SymbolInfoInteger(symbol, SYMBOL_SELECT)) {
       if(!SymbolSelect(symbol, true)) {
          Print("❌ 严重错误: 品种 ", symbol, " 不存在或不可交易");
@@ -242,7 +395,6 @@ void ExecuteTrade(string symbol, string side, double qty)
       }
    }
 
-   // 执行层二次白名单校验
    if(allowedSymbols != "" && StringFind(allowedSymbols, symbol) == -1) {
       Print("⚠️ [二次拦截] 品种 ", symbol, " 不在白名单内，跳过交易");
       return;
@@ -260,7 +412,6 @@ void ExecuteTrade(string symbol, string side, double qty)
    
    if(isBuy) 
    {
-      // 严格反手逻辑
       if(CountPositionsBySymbol(symbol, POSITION_TYPE_SELL) > 0) {
          if(!CloseAllPositionsByType(symbol, POSITION_TYPE_SELL)) {
              Print("❌ 反手平仓(Sell)失败，为了安全，取消开(Buy)新仓");
@@ -269,15 +420,14 @@ void ExecuteTrade(string symbol, string side, double qty)
          }
       }
       if(CountPositionsBySymbol(symbol, POSITION_TYPE_BUY) < maxPositions) {
-         // ✅ 计算硬止损价格 (服务器端)
          double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
          double slPrice = ask * (1.0 - hardStopLossPercent / 100.0);
-         if(trade.Buy(tradeQty, symbol, ask, slPrice, 0)) Print("✅ 买入成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2));
+         // 使用传入的 comment
+         if(trade.Buy(tradeQty, symbol, ask, slPrice, 0, comment)) Print("✅ 买入成功: ", symbol, " ", comment);
       }
    } 
    else if(isSell) 
    {
-      // 严格反手逻辑
       if(CountPositionsBySymbol(symbol, POSITION_TYPE_BUY) > 0) {
          if(!CloseAllPositionsByType(symbol, POSITION_TYPE_BUY)) {
              Print("❌ 反手平仓(Buy)失败，为了安全，取消开(Sell)新仓");
@@ -286,10 +436,10 @@ void ExecuteTrade(string symbol, string side, double qty)
          }
       }
       if(CountPositionsBySymbol(symbol, POSITION_TYPE_SELL) < maxPositions) {
-         // ✅ 计算硬止损价格 (服务器端)
          double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
          double slPrice = bid * (1.0 + hardStopLossPercent / 100.0);
-         if(trade.Sell(tradeQty, symbol, bid, slPrice, 0)) Print("✅ 卖出成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2));
+         // 使用传入的 comment
+         if(trade.Sell(tradeQty, symbol, bid, slPrice, 0, comment)) Print("✅ 卖出成功: ", symbol, " ", comment);
       }
    }
    
@@ -320,12 +470,11 @@ void ManageRisk(string symbol, ulong ticket)
       double oldHigh = trackers[trackerIndex].highestPnl;
       trackers[trackerIndex].highestPnl = pnlPercent;
       
-      // ✅ [持久化] 同步更新到终端全局变量，防止重载失忆
       string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
       GlobalVariableSet(gvName, trackers[trackerIndex].highestPnl);
       
       if(oldHigh > 0 && pnlPercent - oldHigh > 0.5)
-         Print("📈 ", symbol, " 新高:", DoubleToString(pnlPercent, 2), "%");
+         Print("📈 ", symbol, " 新高:", DoubleToString(pnlPercent, 2), "%\n");
    }
 
    // 1. 动态止损
@@ -339,9 +488,9 @@ void ManageRisk(string symbol, ulong ticket)
          SendPushNotification(msg);
          trackers[trackerIndex].isActive = false;
          
-         // ✅ [清理] 删除全局变量
          string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
          GlobalVariableDel(gvName);
+         // 注意：止损不触发回补
       }
       return;
    }
@@ -353,7 +502,7 @@ void ManageRisk(string symbol, ulong ticket)
       double breakEvenPrice = entryPrice;
       double currentSL = PositionGetDouble(POSITION_SL);
       bool needBreakEven = false;
-      double protectBuffer = SymbolInfoDouble(symbol, SYMBOL_POINT) * 200; // [Exness-Gold] 200点缓冲
+      double protectBuffer = SymbolInfoDouble(symbol, SYMBOL_POINT) * 200; 
       if(type == POSITION_TYPE_BUY)
       {
          if(currentSL == 0 || currentSL < breakEvenPrice - protectBuffer) needBreakEven = true;
@@ -364,7 +513,7 @@ void ManageRisk(string symbol, ulong ticket)
       }
       if(needBreakEven)
       {
-         if(trade.PositionModify(ticket, breakEvenPrice, 0))
+         if(trade.PositionModify(ticket, breakEvenPrice, 0)) 
             Print(symbol, " 🔒 保本已设置");
       }
    }
@@ -382,17 +531,23 @@ void ManageRisk(string symbol, ulong ticket)
       if(trackers[trackerIndex].highestPnl < 2.5) currentGap = trailGap_Level1;
       else if(trackers[trackerIndex].highestPnl < 4.5) currentGap = trailGap_Level2;
       else currentGap = trailGap_Level3;
+      
       if(drawdown >= currentGap)
       {
+         // 准备出场前获取信息，用于回补
+         double exitPrice = currentPrice; // 近似出场价
+         
          if(trade.PositionClose(ticket))
          {
             string msg = symbol + " 📈 止盈平仓\n获利:" + DoubleToString(pnlPercent, 2) + "%";
             SendPushNotification(msg);
             trackers[trackerIndex].isActive = false;
             
-            // ✅ [清理] 删除全局变量
             string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
             GlobalVariableDel(gvName);
+
+            // 触发自动回补逻辑
+            RegisterReEntryTask(symbol, type, exitPrice);
          }
       }
    }
@@ -406,7 +561,7 @@ void ManageRisk(string symbol, ulong ticket)
          string trailingStatus = (trackers[trackerIndex].highestPnl >= trailingStartPercent) ? "✅ 已启动" : "⏳ 待启动";
          string msg = "💓 EA心跳 (" + IntegerToString(magicNumber) + ")\n" +
                       symbol + "\n" +
-                      "当前: " + DoubleToString(pnlPercent, 2) + "%";
+                      "当前: " + DoubleToString(pnlPercent, 2) + "%" ;
          SendPushNotification(msg);
          trackers[trackerIndex].lastHeartbeatTime = TimeCurrent();
       }
@@ -418,7 +573,6 @@ int GetOrCreateTracker(ulong ticket, string symbol) {
    int total = ArraySize(trackers);
    for(int i=0; i<total; i++) if(trackers[i].ticket == ticket && trackers[i].isActive) return i;
    
-   // 查找空闲槽或扩容
    int targetIndex = -1;
    for(int i=0; i<total; i++) if(!trackers[i].isActive) { targetIndex = i; break; }
    if(targetIndex == -1) { targetIndex = ArraySize(trackers); ArrayResize(trackers, targetIndex+1); }
@@ -429,11 +583,10 @@ int GetOrCreateTracker(ulong ticket, string symbol) {
    trackers[targetIndex].lastHeartbeatTime = 0; 
    trackers[targetIndex].startLogSent = false;
    
-   // ✅ [恢复] 从终端全局变量加载历史最高盈利
    string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
    if(GlobalVariableCheck(gvName)) {
       trackers[targetIndex].highestPnl = GlobalVariableGet(gvName);
-      Print("📥 持久化恢复: Ticket=", ticket, " 历史最高盈利=", trackers[targetIndex].highestPnl, "%");
+      Print("📥 持久化恢复: Ticket=", ticket, " 历史最高盈利=", trackers[targetIndex].highestPnl, "%\n");
    } else {
       trackers[targetIndex].highestPnl = 0.0;
    }
@@ -445,7 +598,6 @@ void CleanupClosedPositions() {
    for(int i=ArraySize(trackers)-1; i>=0; i--) {
       if(!trackers[i].isActive) continue;
       if(!PositionSelectByTicket(trackers[i].ticket)) {
-         // ✅ 平仓后清理残留的全局变量
          string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(trackers[i].ticket) + "_PNL";
          GlobalVariableDel(gvName);
          trackers[i].isActive = false;
