@@ -363,43 +363,48 @@ void CheckReEntry()
             
             string side = (reEntries[i].type == POSITION_TYPE_BUY) ? "buy" : "sell";
             
-            currentSignalReEntryCount++;
-            ExecuteTrade(symbol, side, 0, "[ReEntry]"); 
-            reEntries[i].active = false; 
-            
-            string msg = "🔄 自动回补执行: " + symbol + " (累计:" + IntegerToString(currentSignalReEntryCount) + "/" + IntegerToString(maxReEntryTimes) + ")";
-            SendPushNotification(msg);
+            // ✅ 改动 1: 执行后根据返回值判断是否计数
+            ulong dealTicket = 0;
+            if(ExecuteTrade(symbol, side, 0, "[ReEntry]", dealTicket)) {
+                currentSignalReEntryCount++;
+                reEntries[i].active = false; 
+                string msg = "🔄 自动回补执行成功: " + symbol + " (累计:" + IntegerToString(currentSignalReEntryCount) + "/" + IntegerToString(maxReEntryTimes) + ")";
+                SendPushNotification(msg);
+            } else {
+                Print("⚠️ [回补] 交易执行失败，等待下一次 tick 重试。");
+            }
         }
     }
 }
 
 //+------------------------------------------------------------------+
-//| 执行交易                                                         |
+//| 执行交易 (改动: 返回 bool + 3次重试)                             |
 //+------------------------------------------------------------------+
-void ExecuteTrade(string symbol, string side, double qty, string comment = "") 
+bool ExecuteTrade(string symbol, string side, double qty, string comment = "", ulong &outDealTicket = 0) 
 {
    if(!SymbolInfoInteger(symbol, SYMBOL_SELECT)) {
       if(!SymbolSelect(symbol, true)) {
          Print("❌ 严重错误: 品种 ", symbol, " 不存在或不可交易");
-         return;
+         return false;
       }
    }
 
    // 执行层二次白名单校验
    if(allowedSymbols != "" && StringFind(allowedSymbols, symbol) == -1) {
       Print("⚠️ [二次拦截] 品种 ", symbol, " 不在白名单内，跳过交易");
-      return;
+      return false;
    }
 
    string lockName = "TRADE_LOCK_" + symbol + "_" + side;
    if(GlobalVariableCheck(lockName)) {
-      if(TimeCurrent() - (datetime)GlobalVariableGet(lockName) < 10) return;
+      if(TimeCurrent() - (datetime)GlobalVariableGet(lockName) < 10) return false;
    }
    GlobalVariableSet(lockName, (double)TimeCurrent());
    
    double tradeQty = qty > 0 ? qty : lotSize;
    bool isBuy = (StringCompare(side, "buy", false) == 0);
    bool isSell = (StringCompare(side, "sell", false) == 0);
+   bool result = false;
    
    if(isBuy) 
    {
@@ -407,15 +412,28 @@ void ExecuteTrade(string symbol, string side, double qty, string comment = "")
          if(!CloseAllPositionsByType(symbol, POSITION_TYPE_SELL)) {
              Print("❌ 反手平仓(Sell)失败，为了安全，取消开(Buy)新仓");
              GlobalVariableDel(lockName);
-             return;
+             return false;
          }
       }
       if(CountPositionsBySymbol(symbol, POSITION_TYPE_BUY) < maxPositions) {
          // 硬止损
          double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
          double slPrice = ask * (1.0 - hardStopLossPercent / 100.0);
-         // 使用传入的 comment
-         if(trade.Buy(tradeQty, symbol, ask, slPrice, 0, comment)) Print("✅ 买入成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment);
+         
+         // ✅ 改动 3: 3次重试机制
+         for(int i=0; i<3; i++) {
+             if(trade.Buy(tradeQty, symbol, ask, slPrice, 0, comment)) {
+                 Print("✅ 买入成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment, " Deal=", trade.ResultDeal());
+                 outDealTicket = trade.ResultDeal();
+                 result = true;
+                 break;
+             } else {
+                 Print("⚠️ 买入失败(尝试 ", i+1, "/3): ", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
+                 Sleep(200);
+                 ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+                 slPrice = ask * (1.0 - hardStopLossPercent / 100.0);
+             }
+         }
       }
    } 
    else if(isSell) 
@@ -424,19 +442,33 @@ void ExecuteTrade(string symbol, string side, double qty, string comment = "")
          if(!CloseAllPositionsByType(symbol, POSITION_TYPE_BUY)) {
              Print("❌ 反手平仓(Buy)失败，为了安全，取消开(Sell)新仓");
              GlobalVariableDel(lockName);
-             return;
+             return false;
          }
       }
       if(CountPositionsBySymbol(symbol, POSITION_TYPE_SELL) < maxPositions) {
          // 硬止损
          double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
          double slPrice = bid * (1.0 + hardStopLossPercent / 100.0);
-         // 使用传入的 comment
-         if(trade.Sell(tradeQty, symbol, bid, slPrice, 0, comment)) Print("✅ 卖出成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment);
+         
+         // ✅ 改动 3: 3次重试机制
+         for(int i=0; i<3; i++) {
+             if(trade.Sell(tradeQty, symbol, bid, slPrice, 0, comment)) {
+                 Print("✅ 卖出成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment, " Deal=", trade.ResultDeal());
+                 outDealTicket = trade.ResultDeal();
+                 result = true;
+                 break;
+             } else {
+                 Print("⚠️ 卖出失败(尝试 ", i+1, "/3): ", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
+                 Sleep(200);
+                 bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+                 slPrice = bid * (1.0 + hardStopLossPercent / 100.0);
+             }
+         }
       }
    }
    
    GlobalVariableDel(lockName);
+   return result;
 }
 
 //+------------------------------------------------------------------+
@@ -471,7 +503,7 @@ void ManageRisk(string symbol, ulong ticket)
    if(volume > 0.05) currentStopLoss = heavyPosStopLoss;
    if(pnlPercent < -currentStopLoss)
    {
-      if(trade.PositionClose(ticket))
+      if(TryPositionClose(ticket, symbol)) // ✅ 使用带重试的平仓
       {
          string msg = symbol + " 🛑 外汇止损\n亏损:" + DoubleToString(pnlPercent, 2) + "%";
          SendPushNotification(msg);
@@ -531,8 +563,22 @@ void ManageRisk(string symbol, ulong ticket)
          // 准备出场前获取信息，用于回补
          double exitPrice = currentPrice;
          
-         if(trade.PositionClose(ticket))
+         if(TryPositionClose(ticket, symbol)) // ✅ 使用带重试的平仓
          {
+            // ✅ 改动 2: 获取真实成交价
+            ulong deal = trade.ResultDeal();
+            if(deal > 0) {
+                if(HistoryDealSelect(deal)) {
+                    double realPrice = HistoryDealGetDouble(deal, DEAL_PRICE);
+                    if(realPrice > 0) {
+                        exitPrice = realPrice;
+                        Print("📉 真实平仓价获取成功: ", exitPrice, " (原参考价: ", currentPrice, ")");
+                    }
+                }
+            } else {
+               Print("⚠️ 警告: 无法获取平仓 Deal Ticket, 使用参考价: ", exitPrice);
+            }
+
             string msg = symbol + " 📈 止盈平仓\n获利:" + DoubleToString(pnlPercent, 2) + "%";
             SendPushNotification(msg);
             trackers[trackerIndex].isActive = false;
@@ -557,6 +603,17 @@ void ManageRisk(string symbol, ulong ticket)
          trackers[trackerIndex].lastHeartbeatTime = TimeCurrent();
       }
    }
+}
+
+// ✅ 封装带重试的平仓函数
+bool TryPositionClose(ulong ticket, string symbol) {
+   for(int i=0; i<3; i++) {
+      if(trade.PositionClose(ticket)) return true;
+      Print("⚠️ 平仓失败(尝试 ", i+1, "/3): ", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
+      Sleep(200);
+   }
+   Print("❌ 平仓彻底失败: Ticket=", ticket);
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -653,7 +710,7 @@ bool CloseAllPositionsByType(string symbol, ENUM_POSITION_TYPE posType)
              posType_actual == posType &&
              (allowedSymbols=="" || StringFind(allowedSymbols, posSymbol)!=-1) )
          {
-            if(trade.PositionClose(ticket))
+            if(TryPositionClose(ticket, symbol)) // ✅ 使用带重试的平仓
             {
                Print("✅ 平仓成功: Ticket=", ticket);
                for(int j=0; j<ArraySize(trackers); j++) {
@@ -667,8 +724,7 @@ bool CloseAllPositionsByType(string symbol, ENUM_POSITION_TYPE posType)
             }
             else
             {
-               Print("❌ 平仓失败: ", trade.ResultRetcode());
-               allClosed = false;
+               allClosed = false; // TryPositionClose 已经打印了错误
             }
             Sleep(100);
          }
