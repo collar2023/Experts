@@ -83,6 +83,18 @@ int currentSignalReEntryCount = 0; // ✅ 全局计数器：当前信号周期�
 PositionTracker trackers[];
 ReEntryTask reEntries[];
 
+//--- 前向声明
+bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong &outDealTicket);
+bool TryPositionClose(ulong ticket, string symbol);
+int GetOrCreateTracker(ulong ticket, string symbol);
+void CleanupClosedPositions();
+int CountPositionsBySymbol(string symbol, ENUM_POSITION_TYPE posType = -1);
+bool CloseAllPositionsByType(string symbol, ENUM_POSITION_TYPE posType);
+string ParseJsonValue(string json, string key);
+void SendPushNotification(string message);
+void ManageRisk(string symbol, ulong ticket);
+void CheckReEntry();
+
 //+------------------------------------------------------------------+
 //| 辅助：内存清理                                                    |
 //+------------------------------------------------------------------+
@@ -264,14 +276,15 @@ void OnTimer()
          
          string side   = ParseJsonValue(jsonResponse,"side");
          double qty    = StringToDouble(ParseJsonValue(jsonResponse, "qty"));
-         string msg = ">>> 收到新信号
-ID=" + lastSignalId + "
-品种=" + symbol + "
-方向=" + side;
+         string msg = ">>> 收到新信号\n" +
+                      "ID=" + lastSignalId + "\n" +
+                      "品种=" + symbol + "\n" +
+                      "方向=" + side;
          Print(msg);
          SendPushNotification(msg);
 
-         ExecuteTrade(symbol, side, qty, ""); // 正常信号开单
+         ulong ticket = 0;
+         ExecuteTrade(symbol, side, qty, "", ticket); // 正常信号开单
       }
    }
    else if(res == 401)
@@ -393,7 +406,7 @@ void CheckReEntry()
 //+------------------------------------------------------------------+
 //| 执行交易 (改动 4: 返回 bool + 3次重试)                          |
 //+------------------------------------------------------------------+
-bool ExecuteTrade(string symbol, string side, double qty, string comment = "", ulong &outDealTicket = 0) 
+bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong &outDealTicket) 
 {
    if(!SymbolInfoInteger(symbol, SYMBOL_SELECT)) {
       if(!SymbolSelect(symbol, true)) {
@@ -521,8 +534,8 @@ void ManageRisk(string symbol, ulong ticket)
    {
       if(TryPositionClose(ticket, symbol)) // 使用带重试的平仓
       {
-         string msg = symbol + " 🛑 止损平仓
-亏损:" + DoubleToString(pnlPercent, 2) + "%";
+         string msg = symbol + " 🛑 止损平仓\n" +
+                      "亏损:" + DoubleToString(pnlPercent, 2) + "%";
          SendPushNotification(msg);
          trackers[trackerIndex].isActive = false;
          
@@ -592,8 +605,8 @@ void ManageRisk(string symbol, ulong ticket)
                Print("⚠️ 警告: 无法获取平仓 Deal Ticket, 使用参考价: ", exitPrice);
             }
             
-            string msg = symbol + " 📈 止盈平仓
-获利:" + DoubleToString(pnlPercent, 2) + "%";
+            string msg = symbol + " 📈 止盈平仓\n" +
+                         "获利:" + DoubleToString(pnlPercent, 2) + "%";
             SendPushNotification(msg);
             trackers[trackerIndex].isActive = false;
             
@@ -613,10 +626,8 @@ void ManageRisk(string symbol, ulong ticket)
       if(timeSinceLastHeartbeat >= heartbeatInterval)
       {
          string trailingStatus = (trackers[trackerIndex].highestPnl >= trailingStartPercent) ? "✅ 已启动" : "⏳ 待启动";
-         string msg = "💓 EA心跳 (" + IntegerToString(magicNumber) + ")
-" +
-                      symbol + "
-" +
+         string msg = "💓 EA心跳 (" + IntegerToString(magicNumber) + ")\n" +
+                      symbol + "\n" +
                       "当前: " + DoubleToString(pnlPercent, 2) + "%";
          SendPushNotification(msg);
          trackers[trackerIndex].lastHeartbeatTime = TimeCurrent();
@@ -726,13 +737,13 @@ bool CloseAllPositionsByType(string symbol, ENUM_POSITION_TYPE posType) {
 }
 
 string ParseJsonValue(string json, string key) { 
-   string sk_string = """ + key + "":"";
+   string sk_string = "\"" + key + "\":\"";
    int p1 = StringFind(json, sk_string);
    if(p1 != -1) {
-      int p2 = StringFind(json, """, p1 + StringLen(sk_string));
+      int p2 = StringFind(json, "\"", p1 + StringLen(sk_string));
       if(p2 != -1) return StringSubstr(json, p1 + StringLen(sk_string), p2 - (p1 + StringLen(sk_string)));
    }
-   string sk_number = """ + key + "":";
+   string sk_number = "\"" + key + "\":";
    p1 = StringFind(json, sk_number);
    if(p1 != -1) {
       int start = p1 + StringLen(sk_number);
