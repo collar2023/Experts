@@ -10,7 +10,7 @@
 //--- ========================================== 
 // [重要] 请在 URL 后加上 ?token=您的Token
 input string serverUrl            = "https://gold.460001.xyz/get_signal?token=121218679";
-input int    timerSeconds         = 1;          // ✅ 极速轮询
+input int    timerSeconds         = 3;          // ✅ 极速轮询
 input ulong  magicNumber          = 640002;     // ⚠️ 注意: 不同品种挂EA时，请修改此号码
 input bool   manageManualOrders   = true;       // ✅ 是否接管手动开出的订单 (Magic=0)
 
@@ -25,9 +25,9 @@ input double lotSize              = 0.01;       // 固定手数
 input int    maxPositions         = 2;          // 最大持仓数
 
 input group  "=== 动态止损设置 ==="
-input double baseStopLossPercent  = 0.8;        // 基础止损
-input double heavyPosStopLoss     = 0.6;        // 重仓止损
-input double hardStopLossPercent  = 1.0;        // ✅ 开仓硬止损 (服务器端)
+input double baseStopLossPercent  = 1.5;        // 基础止损
+input double heavyPosStopLoss     = 1.2;        // 重仓止损
+input double hardStopLossPercent  = 1.5;        // ✅ 开仓硬止损 (服务器端)
 
 input group  "=== 移动止盈设置 ==="
 input bool   trailingStopEnabled  = true;       // 是否开启移动止盈
@@ -40,7 +40,7 @@ input double trailGap_Level3      = 0.6;        // 后期回撤
 
 input group  "=== 自动回补进场 (Auto Re-Entry) ==="
 input bool   enableReEntry        = true;       // 是否开启趋势回调补单
-input double reEntryPullbackPct   = 0.12;       // 回调触发阈值% (例如 0.12% = 4600金价回调5.5美金)
+input double reEntryPullbackPct   = 0.18;       // 回调触发阈值% (例如 0.12% = 4600金价回调5.5美金)
 input int    maxReEntryTimes      = 2;          // 单个信号允许补单次数
 input int    reEntryCooldown      = 60;         // 补单冷却时间(秒)
 
@@ -74,6 +74,7 @@ struct ReEntryTask {
    int      count;         // 已补单次数
    datetime lastExitTime;  // 上次出场时间
    bool     active;        // 任务是否激活
+   int      failureCount;  // 连续失败次数
 };
 
 //--- 全局变量
@@ -331,6 +332,7 @@ void RegisterReEntryTask(string symbol, long type, double exitPrice)
     reEntries[index].signalId     = lastSignalId;
     reEntries[index].lastExitTime = TimeCurrent();
     reEntries[index].active       = true;
+    reEntries[index].failureCount = 0; // ✅ 初始化失败计数
 
     double targetPrice = 0;
     if(type == POSITION_TYPE_BUY) targetPrice = exitPrice * (1.0 - reEntryPullbackPct/100.0);
@@ -396,8 +398,16 @@ void CheckReEntry()
                 string msg = "🔄 自动回补执行成功: " + symbol + " (累计:" + IntegerToString(currentSignalReEntryCount) + "/" + IntegerToString(maxReEntryTimes) + ")";
                 SendPushNotification(msg);
             } else {
-                Print("⚠️ [回补] 交易执行失败，等待下一次 tick 重试。");
-                // active 保持 true，下次 tick 继续尝试
+                // ✅ 熔断机制
+                reEntries[i].failureCount++;
+                Print("⚠️ [回补] 交易失败 (累计失败: ", reEntries[i].failureCount, ")");
+                
+                if(reEntries[i].failureCount >= 5) {
+                    reEntries[i].active = false;
+                    string errMsg = "⛔ [熔断] " + symbol + " 回补任务因连续失败 5 次而被取消";
+                    Print(errMsg);
+                    SendPushNotification(errMsg);
+                }
             }
         }
     }

@@ -72,6 +72,7 @@ struct ReEntryTask {
    int      count;         // 已补单次数
    datetime lastExitTime;  // 上次出场时间
    bool     active;        // 任务是否激活
+   int      failureCount;  // 连续失败次数
 };
 
 //--- 全局变量
@@ -345,6 +346,7 @@ void RegisterReEntryTask(string symbol, long type, double exitPrice)
     reEntries[index].signalId     = lastSignalId;
     reEntries[index].lastExitTime = TimeCurrent();
     reEntries[index].active       = true;
+    reEntries[index].failureCount = 0; // ✅ 初始化失败计数
 
     double targetPrice = 0;
     if(type == POSITION_TYPE_BUY) targetPrice = exitPrice * (1.0 - reEntryPullbackPct/100.0);
@@ -401,7 +403,7 @@ void CheckReEntry()
             
             string side = (reEntries[i].type == POSITION_TYPE_BUY) ? "buy" : "sell";
             
-            // ✅ 执行后根据返回值判断是否计数
+            // ✅ 改动 1: 执行后根据返回值判断是否计数
             ulong dealTicket = 0;
             if(ExecuteTrade(symbol, side, 0, "[ReEntry]", dealTicket)) {
                 currentSignalReEntryCount++;
@@ -409,275 +411,18 @@ void CheckReEntry()
                 string msg = "🔄 自动回补执行成功: " + symbol + " (累计:" + IntegerToString(currentSignalReEntryCount) + "/" + IntegerToString(maxReEntryTimes) + ")";
                 SendPushNotification(msg);
             } else {
-                Print("⚠️ [回补] 交易执行失败，等待下一次 tick 重试。");
+                reEntries[i].failureCount++;
+                Print("⚠️ [回补] 交易失败 (累计失败: ", reEntries[i].failureCount, ")");
+                
+                if(reEntries[i].failureCount >= 5) {
+                    reEntries[i].active = false;
+                    string errMsg = "⛔ [熔断] " + symbol + " 回补任务因连续失败 5 次而被取消";
+                    Print(errMsg);
+                    SendPushNotification(errMsg);
+                }
             }
         }
     }
-}
-
-//+------------------------------------------------------------------+
-//| 风险管理 (指数参数化版)                                           |
-//+------------------------------------------------------------------+
-void ManageRisk(string symbol, ulong ticket)
-{
-   if(!PositionSelectByTicket(ticket)) return;
-
-   double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-   double volume = PositionGetDouble(POSITION_VOLUME);
-   long type = PositionGetInteger(POSITION_TYPE);
-   if(entryPrice==0.0) return;
-
-   double currentPrice = (type==POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol,SYMBOL_BID) : SymbolInfoDouble(symbol,SYMBOL_ASK);
-   double pnlPercent = (currentPrice - entryPrice) * ((type==POSITION_TYPE_BUY)?1:-1) / entryPrice * 100.0;
-
-   int trackerIndex = GetOrCreateTracker(ticket, symbol);
-   if(trackerIndex < 0 || trackerIndex >= ArraySize(trackers)) return;
-
-   // 峰值更新
-   if(pnlPercent > trackers[trackerIndex].highestPnl)
-   {
-      trackers[trackerIndex].highestPnl = pnlPercent;
-      // 持久化最高点
-      string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
-      GlobalVariableSet(gvName, trackers[trackerIndex].highestPnl);
-   }
-
-   // 1. 动态止损
-   double currentStopLoss = baseStopLossPercent;
-   if(volume > 0.5) currentStopLoss = heavyPosStopLoss;
-   if(pnlPercent < -currentStopLoss)
-   {
-      if(TryPositionClose(ticket, symbol)) // 使用带重试的平仓
-      {
-         string msg = symbol + " 🛑 指数止损\n" +
-                      "亏损:" + DoubleToString(pnlPercent, 2) + "%";
-         SendPushNotification(msg);
-         trackers[trackerIndex].isActive = false;
-         // 清理
-         string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
-         GlobalVariableDel(gvName);
-      }
-      return;
-   }
-
-   // 2. 保本 (与移动止盈差额 0.1)
-   double breakEvenTrigger = (trailingStartPercent > 0.3) ? 0.3 : trailingStartPercent;
-   
-   if(pnlPercent >= breakEvenTrigger)
-   {
-      double breakEvenPrice = entryPrice;
-      double currentSL = PositionGetDouble(POSITION_SL);
-      bool needBreakEven = false;
-      double protectBuffer = SymbolInfoDouble(symbol, SYMBOL_POINT) * 100; // [Exness-Index] 100点缓冲
-
-      if(type == POSITION_TYPE_BUY)
-      {
-         if(currentSL == 0 || currentSL < breakEvenPrice - protectBuffer) needBreakEven = true;
-      }
-      else
-      {
-         if(currentSL > breakEvenPrice + protectBuffer || currentSL == 0) needBreakEven = true;
-      }
-      if(needBreakEven)
-      {
-         if(trade.PositionModify(ticket, breakEvenPrice, 0))
-            Print(symbol, " 🔒 保本已设置");
-      }
-   }
-
-   // 3. 移动止盈 (参数化)
-   if(trailingStopEnabled && trackers[trackerIndex].highestPnl >= trailingStartPercent)
-   {
-      if(!trackers[trackerIndex].startLogSent)
-      {
-         SendPushNotification(symbol + " 🚀 指数追踪启动");
-         trackers[trackerIndex].startLogSent = true;
-      }
-      
-      double drawdown = trackers[trackerIndex].highestPnl - pnlPercent;
-      double currentGap = 0.0;
-      
-      if(trackers[trackerIndex].highestPnl < 2.5) 
-         currentGap = trailGap_Level1;
-      else if(trackers[trackerIndex].highestPnl < 5.0) 
-         currentGap = trailGap_Level2;
-      else 
-         currentGap = trailGap_Level3;
-      if(drawdown >= currentGap)
-      {
-         // 准备出场前获取信息，用于回补
-         double exitPrice = currentPrice;
-         
-         if(TryPositionClose(ticket, symbol)) // 使用带重试的平仓
-         {
-            // 获取真实成交价
-            ulong deal = trade.ResultDeal();
-            if(deal > 0) {
-                if(HistoryDealSelect(deal)) {
-                    double realPrice = HistoryDealGetDouble(deal, DEAL_PRICE);
-                    if(realPrice > 0) {
-                        exitPrice = realPrice;
-                        Print("📉 真实平仓价获取成功: ", exitPrice, " (原参考价: ", currentPrice, ")");
-                    }
-                }
-            }
-
-            string msg = symbol + " 📈 指数止盈\n" +
-                         "获利:" + DoubleToString(pnlPercent, 2) + "%";
-            SendPushNotification(msg);
-            trackers[trackerIndex].isActive = false;
-            // 清理
-            string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
-            GlobalVariableDel(gvName);
-            
-            // 触发自动回补逻辑
-            RegisterReEntryTask(symbol, type, exitPrice);
-         }
-      }
-   }
-   
-   // 心跳推送
-   if(enableHeartbeatPush)
-   {
-      datetime timeSinceLastHeartbeat = TimeCurrent() - trackers[trackerIndex].lastHeartbeatTime;
-      if(timeSinceLastHeartbeat >= heartbeatInterval)
-      {
-         string trailingStatus = (trackers[trackerIndex].highestPnl >= trailingStartPercent) ? "✅ 已启动" : "⏳ 待启动";
-         string msg = "💓 指数EA心跳\n" +
-                      symbol + "\n" +
-                      "当前: " + DoubleToString(pnlPercent, 2) + "%";
-         SendPushNotification(msg);
-         trackers[trackerIndex].lastHeartbeatTime = TimeCurrent();
-      }
-   }
-}
-
-// ✅ 封装带重试的平仓函数
-bool TryPositionClose(ulong ticket, string symbol) {
-   for(int i=0; i<3; i++) {
-      if(trade.PositionClose(ticket)) return true;
-      Print("⚠️ 平仓失败(尝试 ", i+1, "/3): ", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
-      Sleep(200);
-   }
-   Print("❌ 平仓彻底失败: Ticket=", ticket);
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| 辅助函数集合 (完整版)                                             |
-//+------------------------------------------------------------------+
-int GetOrCreateTracker(ulong ticket, string symbol)
-{
-   int total = ArraySize(trackers);
-   for(int i=0; i<total; i++)
-   {
-      if(trackers[i].ticket == ticket && trackers[i].isActive) return i;
-   }
-   for(int i=0; i<total; i++)
-   {
-      if(!trackers[i].isActive)
-      {
-         trackers[i].ticket = ticket;
-         trackers[i].symbol = symbol;
-         trackers[i].isActive = true;
-         trackers[i].lastHeartbeatTime = 0;
-         trackers[i].startLogSent = false;
-         
-         string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
-         trackers[i].highestPnl = GlobalVariableCheck(gvName) ? GlobalVariableGet(gvName) : 0.0;
-         return i;
-      }
-   }
-   int size = ArraySize(trackers);
-   ArrayResize(trackers, size+1);
-   trackers[size].ticket = ticket;
-   trackers[size].symbol = symbol;
-   trackers[size].isActive = true;
-   trackers[size].lastHeartbeatTime = 0;
-   trackers[size].startLogSent = false;
-   
-   string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
-   trackers[size].highestPnl = GlobalVariableCheck(gvName) ? GlobalVariableGet(gvName) : 0.0;
-   return size;
-}
-
-void CleanupClosedPositions()
-{
-   for(int i=ArraySize(trackers)-1; i>=0; i--)
-   {
-      if(!trackers[i].isActive) continue;
-      if(!PositionSelectByTicket(trackers[i].ticket)) { 
-         // 清理
-         string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(trackers[i].ticket) + "_PNL";
-         GlobalVariableDel(gvName);
-         trackers[i].isActive = false;
-      }
-   }
-}
-
-int CountPositionsBySymbol(string symbol, ENUM_POSITION_TYPE posType = -1)
-{
-   int count = 0;
-   for(int i = 0; i < PositionsTotal(); i++)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket))
-      {
-         string posSymbol = PositionGetString(POSITION_SYMBOL);
-         long magic = PositionGetInteger(POSITION_MAGIC);
-         
-         // 计数逻辑下沉白名单
-         if( posSymbol == symbol && 
-             (magic == magicNumber || (manageManualOrders && magic == 0)) && 
-             (allowedSymbols=="" || StringFind(allowedSymbols, posSymbol)!=-1) )
-         {
-            if(posType == -1) count++;
-            else if(PositionGetInteger(POSITION_TYPE) == posType) count++;
-         }
-      }
-   }
-   return count;
-}
-
-bool CloseAllPositionsByType(string symbol, ENUM_POSITION_TYPE posType)
-{
-   bool allClosed = true;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionSelectByTicket(ticket))
-      {
-         string posSymbol = PositionGetString(POSITION_SYMBOL);
-         long magic = PositionGetInteger(POSITION_MAGIC);
-         long posType_actual = PositionGetInteger(POSITION_TYPE);
-         
-         // 反手平仓逻辑下沉白名单
-         if( posSymbol == symbol && 
-             (magic == magicNumber || (manageManualOrders && magic == 0)) && 
-             posType_actual == posType &&
-             (allowedSymbols=="" || StringFind(allowedSymbols, posSymbol)!=-1) )
-         {
-            if(TryPositionClose(ticket, symbol)) // ✅ 使用带重试的平仓
-            {
-               Print("✅ 平仓成功: Ticket=", ticket);
-               for(int j=0; j<ArraySize(trackers); j++) {
-                  if(trackers[j].ticket == ticket) {
-                     trackers[j].isActive = false;
-                     // 清理
-                     string gvName = "GV_" + IntegerToString(magicNumber) + "_" + IntegerToString(ticket) + "_PNL";
-                     GlobalVariableDel(gvName);
-                  }
-               }
-            }
-            else
-            {
-               allClosed = false;
-            }
-            Sleep(100);
-         }
-      }
-   }
-   return allClosed;
 }
 
 //+------------------------------------------------------------------+
@@ -734,7 +479,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong 
          double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
          double slPrice = ask * (1.0 - hardStopLossPercent/100.0);
          
-         // 3次重试机制
+         // ✅ 改动 3: 3次重试机制
          for(int i=0; i<3; i++) {
              if(trade.Buy(tradeQty, symbol, ask, slPrice, 0, comment)) {
                  Print("✅ 买入成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment, " Deal=", trade.ResultDeal());
@@ -745,7 +490,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong 
                  Print("⚠️ 买入失败(尝试 ", i+1, "/3): ", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
                  Sleep(200);
                  ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-                 slPrice = ask * (1.0 - hardStopLossPercent / 100.0);
+                 slPrice = ask * (1.0 - hardStopLossPercent/100.0);
              }
          }
       }
@@ -765,7 +510,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong 
          double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
          double slPrice = bid * (1.0 + hardStopLossPercent/100.0);
          
-         // 3次重试机制
+         // ✅ 改动 3: 3次重试机制
          for(int i=0; i<3; i++) {
              if(trade.Sell(tradeQty, symbol, bid, slPrice, 0, comment)) {
                  Print("✅ 卖出成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment, " Deal=", trade.ResultDeal());
@@ -776,7 +521,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong 
                  Print("⚠️ 卖出失败(尝试 ", i+1, "/3): ", trade.ResultRetcode(), " ", trade.ResultRetcodeDescription());
                  Sleep(200);
                  bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-                 slPrice = bid * (1.0 + hardStopLossPercent / 100.0);
+                 slPrice = bid * (1.0 + hardStopLossPercent/100.0);
              }
          }
       }

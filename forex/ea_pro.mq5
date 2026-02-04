@@ -75,6 +75,7 @@ struct ReEntryTask {
    int      count;         // 已补单次数
    datetime lastExitTime;  // 上次出场时间
    bool     active;        // 任务是否激活
+   int      failureCount;  // 连续失败次数
 };
 
 //--- 全局变量
@@ -325,6 +326,7 @@ void RegisterReEntryTask(string symbol, long type, double exitPrice)
     reEntries[index].signalId     = lastSignalId;
     reEntries[index].lastExitTime = TimeCurrent();
     reEntries[index].active       = true;
+    reEntries[index].failureCount = 0;
 
     double targetPrice = 0;
     if(type == POSITION_TYPE_BUY) targetPrice = exitPrice * (1.0 - reEntryPullbackPct/100.0);
@@ -381,7 +383,7 @@ void CheckReEntry()
             
             string side = (reEntries[i].type == POSITION_TYPE_BUY) ? "buy" : "sell";
             
-            // ✅ 执行后根据返回值判断是否计数
+            // ✅ 改动 1: 执行后根据返回值判断是否计数
             ulong dealTicket = 0;
             if(ExecuteTrade(symbol, side, 0, "[ReEntry]", dealTicket)) {
                 currentSignalReEntryCount++;
@@ -389,7 +391,15 @@ void CheckReEntry()
                 string msg = "🔄 自动回补执行成功: " + symbol + " (累计:" + IntegerToString(currentSignalReEntryCount) + "/" + IntegerToString(maxReEntryTimes) + ")";
                 SendPushNotification(msg);
             } else {
+                reEntries[i].failureCount++;
                 Print("⚠️ [回补] 交易执行失败，等待下一次 tick 重试。");
+                
+                if(reEntries[i].failureCount >= 5) {
+                    reEntries[i].active = false;
+                    string errMsg = "⛔ [熔断] " + symbol + " 回补任务因连续失败 5 次而被取消";
+                    Print(errMsg);
+                    SendPushNotification(errMsg);
+                }
             }
         }
     }
@@ -438,7 +448,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong 
          double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
          double slPrice = ask * (1.0 - hardStopLossPercent / 100.0);
          
-         // 3次重试机制
+         // ✅ 改动 3: 3次重试机制
          for(int i=0; i<3; i++) {
              if(trade.Buy(tradeQty, symbol, ask, slPrice, 0, comment)) {
                  Print("✅ 买入成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment, " Deal=", trade.ResultDeal());
@@ -468,7 +478,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong 
          double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
          double slPrice = bid * (1.0 + hardStopLossPercent / 100.0);
          
-         // 3次重试机制
+         // ✅ 改动 3: 3次重试机制
          for(int i=0; i<3; i++) {
              if(trade.Sell(tradeQty, symbol, bid, slPrice, 0, comment)) {
                  Print("✅ 卖出成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment, " Deal=", trade.ResultDeal());
