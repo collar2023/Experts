@@ -84,6 +84,18 @@ int currentSignalReEntryCount = 0; // 全局计数器
 PositionTracker trackers[];
 ReEntryTask reEntries[];
 
+//--- 前向声明
+bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong &outDealTicket);
+bool TryPositionClose(ulong ticket, string symbol);
+int GetOrCreateTracker(ulong ticket, string symbol);
+void CleanupClosedPositions();
+int CountPositionsBySymbol(string symbol, ENUM_POSITION_TYPE posType = -1);
+bool CloseAllPositionsByType(string symbol, ENUM_POSITION_TYPE posType);
+string ParseJsonValue(string json, string key);
+void SendPushNotification(string message);
+void ManageRisk(string symbol, ulong ticket);
+void CheckReEntry();
+
 //+------------------------------------------------------------------+
 //| 辅助：内存清理                                                    |
 //+------------------------------------------------------------------+
@@ -184,6 +196,7 @@ int OnInit()
    
    EventSetTimer(timerSeconds);
    trade.SetExpertMagicNumber(magicNumber);
+   trade.SetAsyncMode(false);
    return(INIT_SUCCEEDED);
 }
 
@@ -258,11 +271,15 @@ void OnTimer()
          
          string side   = ParseJsonValue(jsonResponse,"side");
          double qty    = StringToDouble(ParseJsonValue(jsonResponse, "qty"));
-         string msg = ">>> 收到新信号\nID=" + lastSignalId + "\n品种=" + symbol + "\n方向=" + side;
+         string msg = ">>> 收到新信号\n" +
+                      "ID=" + lastSignalId + "\n" +
+                      "品种=" + symbol + "\n" +
+                      "方向=" + side;
          Print(msg);
          SendPushNotification(msg);
 
-         ExecuteTrade(symbol, side, qty, "");
+         ulong ticket = 0;
+         ExecuteTrade(symbol, side, qty, "", ticket);
       }
    }
    else if(res == 401)
@@ -315,6 +332,7 @@ void RegisterReEntryTask(string symbol, long type, double exitPrice)
 
     Print("🔄 [回补] 任务已注册: ", symbol, 
           " 方向=", (type==POSITION_TYPE_BUY?"Buy":"Sell"), 
+          " 出场价=", exitPrice,
           " 目标价<=", DoubleToString(targetPrice, 2),
           " (Pct:", reEntryPullbackPct, "%, Count:", currentSignalReEntryCount, ")");
 }
@@ -363,7 +381,7 @@ void CheckReEntry()
             
             string side = (reEntries[i].type == POSITION_TYPE_BUY) ? "buy" : "sell";
             
-            // ✅ 改动 1: 执行后根据返回值判断是否计数
+            // ✅ 执行后根据返回值判断是否计数
             ulong dealTicket = 0;
             if(ExecuteTrade(symbol, side, 0, "[ReEntry]", dealTicket)) {
                 currentSignalReEntryCount++;
@@ -380,7 +398,7 @@ void CheckReEntry()
 //+------------------------------------------------------------------+
 //| 执行交易 (改动: 返回 bool + 3次重试)                             |
 //+------------------------------------------------------------------+
-bool ExecuteTrade(string symbol, string side, double qty, string comment = "", ulong &outDealTicket = 0) 
+bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong &outDealTicket) 
 {
    if(!SymbolInfoInteger(symbol, SYMBOL_SELECT)) {
       if(!SymbolSelect(symbol, true)) {
@@ -420,7 +438,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment = "", u
          double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
          double slPrice = ask * (1.0 - hardStopLossPercent / 100.0);
          
-         // ✅ 改动 3: 3次重试机制
+         // 3次重试机制
          for(int i=0; i<3; i++) {
              if(trade.Buy(tradeQty, symbol, ask, slPrice, 0, comment)) {
                  Print("✅ 买入成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment, " Deal=", trade.ResultDeal());
@@ -450,7 +468,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment = "", u
          double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
          double slPrice = bid * (1.0 + hardStopLossPercent / 100.0);
          
-         // ✅ 改动 3: 3次重试机制
+         // 3次重试机制
          for(int i=0; i<3; i++) {
              if(trade.Sell(tradeQty, symbol, bid, slPrice, 0, comment)) {
                  Print("✅ 卖出成功: ", symbol, " 硬止损=", DoubleToString(slPrice, 2), " ", comment, " Deal=", trade.ResultDeal());
@@ -505,7 +523,8 @@ void ManageRisk(string symbol, ulong ticket)
    {
       if(TryPositionClose(ticket, symbol)) // ✅ 使用带重试的平仓
       {
-         string msg = symbol + " 🛑 外汇止损\n亏损:" + DoubleToString(pnlPercent, 2) + "%";
+         string msg = symbol + " 🛑 外汇止损\n" +
+                      "亏损:" + DoubleToString(pnlPercent, 2) + "%";
          SendPushNotification(msg);
          trackers[trackerIndex].isActive = false;
          // 清理
@@ -565,7 +584,7 @@ void ManageRisk(string symbol, ulong ticket)
          
          if(TryPositionClose(ticket, symbol)) // ✅ 使用带重试的平仓
          {
-            // ✅ 改动 2: 获取真实成交价
+            // ✅ 获取真实成交价
             ulong deal = trade.ResultDeal();
             if(deal > 0) {
                 if(HistoryDealSelect(deal)) {
@@ -579,7 +598,8 @@ void ManageRisk(string symbol, ulong ticket)
                Print("⚠️ 警告: 无法获取平仓 Deal Ticket, 使用参考价: ", exitPrice);
             }
 
-            string msg = symbol + " 📈 止盈平仓\n获利:" + DoubleToString(pnlPercent, 2) + "%";
+            string msg = symbol + " 📈 止盈平仓\n" +
+                         "获利:" + DoubleToString(pnlPercent, 2) + "%";
             SendPushNotification(msg);
             trackers[trackerIndex].isActive = false;
             // 清理
