@@ -10,7 +10,7 @@
 //--- ========================================== 
 // [重要] 请在 URL 后加上 ?token=您的Token
 input string serverUrl            = "https://gold.460001.xyz/get_signal?token=121218679";
-input int    timerSeconds         = 3;          // ✅ 极速轮询
+input int    timerSeconds         = 1;          // ✅ 极速轮询
 input ulong  magicNumber          = 640002;     // ⚠️ 注意: 不同品种挂EA时，请修改此号码
 input bool   manageManualOrders   = true;       // ✅ 是否接管手动开出的订单 (Magic=0)
 
@@ -40,9 +40,9 @@ input double trailGap_Level3      = 0.6;        // 后期回撤
 
 input group  "=== 自动回补进场 (Auto Re-Entry) ==="
 input bool   enableReEntry        = true;       // 是否开启趋势回调补单
-input double reEntryPullbackPct   = 0.18;       // 回调触发阈值% (例如 0.12% = 4600金价回调5.5美金)
+input double reEntryPullbackPct   = 0.11;       // 回调触发阈值% (例如 0.12% = 4600金价回调5.5美金)
 input int    maxReEntryTimes      = 2;          // 单个信号允许补单次数
-input int    reEntryCooldown      = 60;         // 补单冷却时间(秒)
+input int    reEntryCooldown      = 10;         // 补单冷却时间(秒)
 
 //--- ========================================== 
 //--- 3. 通知与日志

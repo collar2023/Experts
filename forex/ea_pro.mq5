@@ -43,7 +43,7 @@ input group  "=== 自动回补进场 (Auto Re-Entry) ==="
 input bool   enableReEntry        = true;       // 是否开启趋势回调补单
 input double reEntryPullbackPct   = 0.12;       // 回调触发阈值% (外汇建议0.12%)
 input int    maxReEntryTimes      = 2;          // 单个信号允许补单次数
-input int    reEntryCooldown      = 60;         // 补单冷却时间(秒)
+input int    reEntryCooldown      = 400;        // 补单冷却时间(秒)
 
 //--- ==========================================
 //--- 3. 通知与日志
