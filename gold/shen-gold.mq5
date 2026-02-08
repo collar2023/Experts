@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
-//|               SignalPollerEA_Gold_ReEntry_v7.2.mq5               |
-//|          黄金/石油/通用版 - 商业级稳健架构 (增强鲁棒性版)        |
+//|               SignalPollerEA_Gold_ReEntry_v8.0_Shen.mq5          |
+//|          黄金/石油/通用版 - 支持多空共存 (073185.xyz)            |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade\Trade.mqh>
@@ -9,9 +9,9 @@
 //--- 1. 基础连接设置
 //--- ========================================== 
 // [重要] 请在 URL 后加上 ?token=您的Token
-input string serverUrl            = "https://gold.460001.xyz/get_signal?token=121218679";
-input int    timerSeconds         = 1;          // ✅ 极速轮询
-input ulong  magicNumber          = 640002;     // ⚠️ 注意: 不同品种挂EA时，请修改此号码
+input string serverUrl            = "https://gold.073185.xyz/get_signal?token=121218679";
+input int    timerSeconds         = 3;          // ✅ 极速轮询
+input ulong  magicNumber          = 73185;      // ⚠️ 注意: 不同品种挂EA时，请修改此号码
 input bool   manageManualOrders   = true;       // ✅ 是否接管手动开出的订单 (Magic=0)
 
 // ✅ [核心] 交易品种白名单 (请严格输入: 区分大小写，不要加空格)
@@ -23,6 +23,7 @@ input string allowedSymbols       = "XAUUSDm,XAGUSDm,USOILm";
 //--- ========================================== 
 input double lotSize              = 0.01;       // 固定手数
 input int    maxPositions         = 2;          // 最大持仓数
+input bool   enableHedging        = true;       // 是否允许多空并存 (Hedging)
 
 input group  "=== 动态止损设置 ==="
 input double baseStopLossPercent  = 1.5;        // 基础止损
@@ -41,9 +42,9 @@ input double trailGap_Level3      = 0.6;        // 后期回撤
 
 input group  "=== 自动回补进场 (Auto Re-Entry) ==="
 input bool   enableReEntry        = true;       // 是否开启趋势回调补单
-input double reEntryPullbackPct   = 0.11;       // 回调触发阈值% (例如 0.12% = 4600金价回调5.5美金)
+input double reEntryPullbackPct   = 0.18;       // 回调触发阈值% (例如 0.12% = 4600金价回调5.5美金)
 input int    maxReEntryTimes      = 2;          // 单个信号允许补单次数
-input int    reEntryCooldown      = 10;         // 补单冷却时间(秒)
+input int    reEntryCooldown      = 60;         // 补单冷却时间(秒)
 
 //--- ========================================== 
 //--- 3. 通知与日志
@@ -166,7 +167,7 @@ void SaveLastSignalId(string signalId)
 int OnInit()
 {
    Print("========================================");
-   Print("EA 初始化 - 自动回补增强版 v7.2 (鲁棒性修复)");
+   Print("EA 初始化 - 多空共存版 v8.0 (shen-gold)");
    Print("========================================");
    
    if(StringFind(serverUrl, "token=") == -1)
@@ -444,7 +445,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong 
    
    if(isBuy) 
    {
-      if(CountPositionsBySymbol(symbol, POSITION_TYPE_SELL) > 0) {
+      if(!enableHedging && CountPositionsBySymbol(symbol, POSITION_TYPE_SELL) > 0) {
          if(!CloseAllPositionsByType(symbol, POSITION_TYPE_SELL)) {
              Print("❌ 反手平仓(Sell)失败，为了安全，取消开(Buy)新仓");
              GlobalVariableDel(lockName);
@@ -474,7 +475,7 @@ bool ExecuteTrade(string symbol, string side, double qty, string comment, ulong 
    } 
    else if(isSell) 
    {
-      if(CountPositionsBySymbol(symbol, POSITION_TYPE_BUY) > 0) {
+      if(!enableHedging && CountPositionsBySymbol(symbol, POSITION_TYPE_BUY) > 0) {
          if(!CloseAllPositionsByType(symbol, POSITION_TYPE_BUY)) {
              Print("❌ 反手平仓(Buy)失败，为了安全，取消开(Sell)新仓");
              GlobalVariableDel(lockName);
